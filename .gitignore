@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+
+.env
+
+/AudioBooks/Presentation/library/node_modules/
+/AudioBooks/Catalog/Repository/cache/
+/AudioBooks/Catalog/DB/
+/AudioBooks/Presentation/library/.vite
