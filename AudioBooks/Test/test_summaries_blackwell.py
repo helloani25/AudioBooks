@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR.parent / "Catalog" / "DB" / "gutenbergindex.db"
+DB_PATH = BASE_DIR.parent / "AudioBook" / "Catalog" / "DB" / "gutenbergindex.db"
 DEFAULT_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 
 DEFAULT_CHUNK_TOKENS = 6000
@@ -115,17 +115,62 @@ def parse_args() -> argparse.Namespace:
 
 def _connect_db(db_path: str) -> sqlite3.Connection:
     """Open the SQLite catalog database with a busy timeout and row dict access."""
-    conn = sqlite3.connect(db_path, timeout=60)
+    db_file = Path(db_path)
+    print(f"Connecting to catalog database at {db_file}")
+    if not db_file.is_file():
+        raise FileNotFoundError(
+            f"Catalog database not found at {db_file}. "
+            "Expected AudioBooks/Catalog/DB/gutenbergindex.db to exist before running this test."
+        )
+
+    conn = sqlite3.connect(str(db_file), timeout=60)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 60000")
     return conn
 
 
+def _assert_books_schema(conn: sqlite3.Connection) -> None:
+    """Fail fast when the catalog database does not contain the expected books table."""
+    books_table = _resolve_books_table_name(conn)
+
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({books_table})")
+    columns = {str(row[1]) for row in cur.fetchall()}
+    if "gutenbergbookid" not in columns or "id" not in columns:
+        raise RuntimeError(
+            f"Catalog database schema in table {books_table!r} is missing required columns. "
+            f"Found columns: {sorted(columns)}"
+        )
+
+
+def _resolve_books_table_name(conn: sqlite3.Connection) -> str:
+    """Return the catalog table name used for book records."""
+    cur = conn.cursor()
+    for table_name in ("books", "book"):
+        cur.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
+            (table_name,),
+        )
+        if cur.fetchone() is not None:
+            return table_name
+
+    raise RuntimeError(
+        "Catalog database does not contain a book table named 'books' or 'book'. "
+        "Check that you are pointing at the expected gutenbergindex.db file."
+    )
+
+
 def _resolve_book_id(conn: sqlite3.Connection, book_id: int | None, gutenberg_id: int | None) -> int:
     """Resolve the internal books.id from either a direct id or a Gutenberg id."""
+    books_table = _resolve_books_table_name(conn)
+    _assert_books_schema(conn)
+
     if book_id is not None and gutenberg_id is not None:
         cur = conn.cursor()
-        cur.execute("SELECT id FROM books WHERE id = ? AND gutenbergbookid = ?", (book_id, gutenberg_id))
+        cur.execute(
+            f"SELECT id FROM {books_table} WHERE id = ? AND gutenbergbookid = ?",
+            (book_id, gutenberg_id),
+        )
         row = cur.fetchone()
         if row is None:
             raise ValueError(f"book-id {book_id} does not match gutenberg-id {gutenberg_id}")
@@ -136,7 +181,7 @@ def _resolve_book_id(conn: sqlite3.Connection, book_id: int | None, gutenberg_id
 
     if gutenberg_id is not None:
         cur = conn.cursor()
-        cur.execute("SELECT id FROM books WHERE gutenbergbookid = ?", (gutenberg_id,))
+        cur.execute(f"SELECT id FROM {books_table} WHERE gutenbergbookid = ?", (gutenberg_id,))
         row = cur.fetchone()
         if row is None:
             raise ValueError(f"Could not resolve Gutenberg id {gutenberg_id}")
@@ -147,9 +192,10 @@ def _resolve_book_id(conn: sqlite3.Connection, book_id: int | None, gutenberg_id
 
 def _load_book_record(conn: sqlite3.Connection, book_id: int) -> BookRecord:
     """Load title, authors, and full text for one catalog book."""
+    books_table = _resolve_books_table_name(conn)
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT
             b.id AS book_id,
             COALESCE((SELECT t.name FROM titles t WHERE t.bookid = b.id LIMIT 1), 'Untitled') AS title,
@@ -163,7 +209,7 @@ def _load_book_record(conn: sqlite3.Connection, book_id: int) -> BookRecord:
                 )
             ), '') AS authors,
             COALESCE(book_contents.clean_content, book_contents.raw_content, '') AS text
-        FROM books b
+        FROM {books_table} b
         LEFT JOIN book_contents ON book_contents.bookid = b.id
         WHERE b.id = ?
         """,
