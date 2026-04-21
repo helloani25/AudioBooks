@@ -1,10 +1,18 @@
 import argparse
 import os
 import ssl
+import sqlite3
 import urllib.error
 import urllib.request
+from pathlib import Path
 from os import path, listdir
-from lxml import etree
+
+
+try:
+    from lxml import etree, html as lxml_html
+except ImportError:
+    etree = None
+    lxml_html = None
 
 import gutenbergpy.textget
 from gutenbergpy.gutenbergcache import GutenbergCache
@@ -16,11 +24,73 @@ from gutenbergpy.gutenbergcachesettings import GutenbergCacheSettings
 from gutenbergpy.parse.book import Book
 
 
+try:
+    import chardet
+except ImportError:
+    chardet = None
+
+DOWNLOAD_TYPES = [
+    "text/plain",
+    "text/plain; charset=utf-8",
+    "text/plain; charset=us-ascii",
+]
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_DIR = BASE_DIR.parent / "DB"
+DB_PATH = DB_DIR / "gutenbergindex.db"
+GutenbergCacheSettings.set(
+    CacheFilename=str(DB_PATH),
+    CacheUnpackDir=str(DB_DIR / "cache" / "epub"),
+    CacheArchiveName=str(DB_DIR / "rdf-files.tar.bz2"),
+    TextFilesCacheFolder=str(DB_DIR / "texts"),
+)
+
+def _connect_db(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, timeout=60)
+    conn.execute("PRAGMA busy_timeout = 60000")
+    return conn
+
+def _fetch_gutenberg_cache():
+    if not GutenbergCache.exists():
+        _monkeypatch_rdf_parser()
+        # 1. Create/Refresh the cache (This downloads the massive RDF master file)
+        # This will take a few minutes but gives you EVERY piece of metadata.
+        # The cache is created via the GutenbergCache class, not the SQLiteCache instance.
+        GutenbergCache.create()
+
+        # 2. Define the fields you want to retrieve
+        # LoCC (Library of Congress Class) is the gold standard for genre/subject depth.
+        # Example: 'PR' is English Literature, 'PS' is American Literature.
+    cache = GutenbergCache.get_cache()
+
+    # 3. Query for books. Omit `subjects` to fetch across all subjects.
+    results = cache.query(downloadtype=DOWNLOAD_TYPES)
+
+    # Limit to first 10
+    for book_id in results[:10]:
+        # Use the ID to get the text or more meta-info
+        text = gutenbergpy.textget.get_text_by_id(book_id)
+
+        # SQLiteCache doesn't have a get_metadata method, so we'll use a native query to get the title
+        title_query = f"SELECT titles.name FROM titles JOIN books ON titles.bookid = books.id WHERE books.gutenbergbookid = {book_id}"
+        title_res = list(cache.native_query(title_query))
+        title = title_res[0][0] if title_res else "Unknown"
+
+        print(f"Retrieved Book ID: {book_id} Title: {title}")
+
+
 def _monkeypatch_rdf_parser():
     """
     Monkeypatch RdfParser.do to skip directories that don't follow the pg{id}.rdf convention.
     Specifically fixes 'cache/epub/test/pgtest.rdf' error.
     """
+    if etree is None:
+        raise RuntimeError(
+            "lxml is required for Project Gutenberg cache creation. "
+            "The module can now be imported without it, but this code path still "
+            "needs lxml in the active Python environment."
+        )
+
     original_do = RdfParser.do
 
     @staticmethod
@@ -149,6 +219,36 @@ def _build_arg_parser():
     parser.add_argument("--ca-dir", dest="capath", help="Path to a directory of CA certificates.")
     parser.add_argument("--no-verify", action="store_false", dest="verify", default=True,
                         help="Disable SSL certificate verification.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--refresh-downloadlinks",
+        action="store_true",
+        help="Fetch Project Gutenberg /files/<id>/ index pages and backfill missing downloadlinks rows.",
+    )
+    mode.add_argument(
+        "--repair-downloadlinks",
+        action="store_true",
+        help="Rebuild downloadlinks rows for the selected books from the live Project Gutenberg index.",
+    )
+    parser.add_argument(
+        "--gutenberg-id",
+        dest="gutenberg_ids",
+        action="append",
+        type=int,
+        help="Limit refresh/repair to one or more Gutenberg ids.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Number of concurrent download-index fetch workers for refresh/repair.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit how many books are scanned when using refresh/repair.",
+    )
     return parser
 
 
@@ -157,37 +257,7 @@ def main():
     args = parser.parse_args()
     cafile, capath = _resolve_ca_paths(args.cafile, args.capath, args.verify)
     _install_https_opener(cafile, capath, args.verify)
-
-    if not GutenbergCache.exists():
-        _monkeypatch_rdf_parser()
-        # 1. Create/Refresh the cache (This downloads the massive RDF master file)
-        # This will take a few minutes but gives you EVERY piece of metadata.
-        # The cache is created via the GutenbergCache class, not the SQLiteCache instance.
-        GutenbergCache.create()
-
-    # 2. Define the fields you want to retrieve
-    # LoCC (Library of Congress Class) is the gold standard for genre/subject depth.
-    # Example: 'PR' is English Literature, 'PS' is American Literature.
-    cache = GutenbergCache.get_cache()
-
-    # 3. Query for 100 books from a specific "Deep" subject
-    # Instead of a broad bookshelf, let's search for books tagged with 'Science fiction'
-    # Fixed: Increased the inclusive download types to match most books
-    results = cache.query(downloadtype=['text/plain', 'text/plain; charset=utf-8', 'text/plain; charset=us-ascii'],
-                          subjects=['Science fiction'])
-
-    # Limit to first 10
-    for book_id in results[:10]:
-        # Use the ID to get the text or more meta-info
-        text = gutenbergpy.textget.get_text_by_id(book_id)
-
-        # Fixed: SQLiteCache doesn't have a get_metadata method, so we'll use a native query to get the title
-        title_query = f"SELECT titles.name FROM titles JOIN books ON titles.bookid = books.id WHERE books.gutenbergbookid = {book_id}"
-        title_res = list(cache.native_query(title_query))
-        title = title_res[0][0] if title_res else "Unknown"
-
-        print(f"Retrieved Book ID: {book_id} Title: {title}")
-
+    _fetch_gutenberg_cache()
 
 if __name__ == "__main__":
     try:

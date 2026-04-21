@@ -7,7 +7,7 @@ This script downloads and queries books from Project Gutenberg using the `gutenb
 Run the script directly:
 
 ```bash
-python Guttenberg.py
+python metadata.py
 ```
 
 ## What It Does

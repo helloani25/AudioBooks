@@ -9,3 +9,4 @@ __pycache__/
 /AudioBooks/Catalog/Repository/cache/
 /AudioBooks/Catalog/DB/
 /AudioBooks/Presentation/library/.vite
+/AudioBooks/Presentation/library/dist/
