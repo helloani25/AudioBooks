@@ -1,7 +1,6 @@
 import argparse
 import os
 import ssl
-import sqlite3
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -44,11 +43,6 @@ GutenbergCacheSettings.set(
     CacheArchiveName=str(DB_DIR / "rdf-files.tar.bz2"),
     TextFilesCacheFolder=str(DB_DIR / "texts"),
 )
-
-def _connect_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=60)
-    conn.execute("PRAGMA busy_timeout = 60000")
-    return conn
 
 def _fetch_gutenberg_cache():
     if not GutenbergCache.exists():
@@ -219,36 +213,6 @@ def _build_arg_parser():
     parser.add_argument("--ca-dir", dest="capath", help="Path to a directory of CA certificates.")
     parser.add_argument("--no-verify", action="store_false", dest="verify", default=True,
                         help="Disable SSL certificate verification.")
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument(
-        "--refresh-downloadlinks",
-        action="store_true",
-        help="Fetch Project Gutenberg /files/<id>/ index pages and backfill missing downloadlinks rows.",
-    )
-    mode.add_argument(
-        "--repair-downloadlinks",
-        action="store_true",
-        help="Rebuild downloadlinks rows for the selected books from the live Project Gutenberg index.",
-    )
-    parser.add_argument(
-        "--gutenberg-id",
-        dest="gutenberg_ids",
-        action="append",
-        type=int,
-        help="Limit refresh/repair to one or more Gutenberg ids.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=8,
-        help="Number of concurrent download-index fetch workers for refresh/repair.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Limit how many books are scanned when using refresh/repair.",
-    )
     return parser
 
 

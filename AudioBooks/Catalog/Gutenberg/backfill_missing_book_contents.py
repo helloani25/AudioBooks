@@ -17,6 +17,11 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from gutenbergpy.textget import strip_headers
+from AudioBooks.Catalog.Gutenberg.db_utils import (
+    connect_db as _connect_db,
+    ensure_book_contents_table as _ensure_book_contents_table,
+    with_sqlite_retry as _with_sqlite_retry,
+)
 
 try:
     from lxml import html as lxml_html
@@ -226,30 +231,6 @@ def _looks_like_real_book_text(text: str) -> bool:
         return False
     words = re.findall(r"[A-Za-z0-9]{3,}", stripped)
     return len(words) >= MIN_BOOK_TEXT_WORDS
-
-
-def _connect_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=60)
-    conn.execute("PRAGMA busy_timeout = 60000")
-    return conn
-
-
-def _with_sqlite_retry(fn, *, attempts: int = 8, initial_delay: float = 0.5):
-    delay = initial_delay
-    last_error = None
-    for _ in range(attempts):
-        try:
-            return fn()
-        except sqlite3.OperationalError as exc:
-            message = str(exc).lower()
-            if "locked" not in message and "busy" not in message:
-                raise
-            last_error = exc
-            time.sleep(delay)
-            delay = min(delay * 2, 8.0)
-    if last_error is not None:
-        raise last_error
-    raise sqlite3.OperationalError("database is locked")
 
 
 def _chunked(values: list[int], size: int) -> list[list[int]]:
@@ -873,6 +854,7 @@ def backfill(
     mirror_tries: int = 3,
     chunk_size: int = 500,
 ) -> None:
+    _ensure_book_contents_table(db_path)
     print("stage: scanning catalog for missing books", flush=True)
     missing_books = _get_missing_books(db_path)
     if limit is not None:

@@ -11,6 +11,8 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
+from AudioBooks.Catalog.Gutenberg.db_utils import connect_db as _connect_db
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR.parent / "DB" / "gutenbergindex.db"
@@ -66,12 +68,6 @@ def parse_args() -> argparse.Namespace:
         help="Print scan progress after this many summary rows.",
     )
     return parser.parse_args()
-
-
-def _connect_db(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path, timeout=60)
-    conn.execute("PRAGMA busy_timeout = 60000")
-    return conn
 
 
 def _ensure_tables(conn: sqlite3.Connection) -> None:

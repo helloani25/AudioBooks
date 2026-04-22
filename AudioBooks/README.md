@@ -117,16 +117,16 @@ if str(PROJECT_ROOT) not in sys.path:
 
 ### Importing the Hugging Face Gutenberg dataset
 
-Use `AudioBooks/Catalog/Gutenberg/hf_books_dataset.py` to inspect the dataset and write text into `book_content`.
+Use `AudioBooks/Catalog/Gutenberg/backfill_book_contents_hf_dataset.py` to inspect the dataset and write text into `book_contents`.
 
 Run from the project root:
 ```bash
-python AudioBooks/Catalog/Gutenberg/hf_books_dataset.py --print-columns
-python AudioBooks/Catalog/Gutenberg/hf_books_dataset.py
-python AudioBooks/Catalog/Gutenberg/hf_books_dataset.py --split fr
-python AudioBooks/Catalog/Gutenberg/hf_books_dataset.py --all-splits
-python AudioBooks/Catalog/Gutenberg/hf_books_dataset.py --dry-run --limit 20
-python AudioBooks/Catalog/Gutenberg/hf_books_dataset.py --db-path AudioBooks/Catalog/DB/gutenbergindex.db
+python AudioBooks/Catalog/Gutenberg/backfill_book_contents_hf_dataset.py --print-columns
+python AudioBooks/Catalog/Gutenberg/backfill_book_contents_hf_dataset.py
+python AudioBooks/Catalog/Gutenberg/backfill_book_contents_hf_dataset.py --split fr
+python AudioBooks/Catalog/Gutenberg/backfill_book_contents_hf_dataset.py --all-splits
+python AudioBooks/Catalog/Gutenberg/backfill_book_contents_hf_dataset.py --dry-run --limit 20
+python AudioBooks/Catalog/Gutenberg/backfill_book_contents_hf_dataset.py --db-path AudioBooks/Catalog/DB/gutenbergindex.db
 ```
 
 Arguments:
@@ -137,22 +137,22 @@ Arguments:
 - `--limit <n>`: stop after `n` rows per split.
 - `--db-path <path>`: override the SQLite database location.
 
-The importer matches Hugging Face rows by `row["id"]` against `books.gutenbergbookid`, then stores the text in `book_content.bookid`.
+The importer matches Hugging Face rows by `row["id"]` against `books.gutenbergbookid`, then stores the text in `book_contents.bookid`.
 
 ### Backfilling missing books from Project Gutenberg
 
-To fetch books that are present in the local catalog but still missing from `book_content`, run:
+To fetch books that are present in the local catalog but still missing from `book_contents`, run:
 
 ```bash
-python AudioBooks/Catalog/Gutenberg/backfill_missing_books.py --dry-run --limit 5
-python AudioBooks/Catalog/Gutenberg/backfill_missing_books.py
-python AudioBooks/Catalog/Gutenberg/backfill_missing_books.py --limit 20
-python AudioBooks/Catalog/Gutenberg/backfill_missing_books.py --no-verify
-python AudioBooks/Catalog/Gutenberg/backfill_missing_books.py --workers 16 --mirror-tries 2
-python AudioBooks/Catalog/Gutenberg/backfill_missing_books.py --chunk-size 1000
-python AudioBooks/Catalog/Gutenberg/backfill_missing_books.py --preflight
-python AudioBooks/Catalog/Gutenberg/backfill_missing_books.py --preflight-only
-python AudioBooks/Catalog/Gutenberg/hf_books_dataset.py --db-path AudioBooks/Catalog/DB/gutenbergindex.db --all-splits
+python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py --dry-run --limit 5
+python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py
+python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py --limit 20
+python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py --no-verify
+python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py --workers 16 --mirror-tries 2
+python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py --chunk-size 1000
+python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py --preflight
+python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py --preflight-only
+python AudioBooks/Catalog/Gutenberg/backfill_book_contents_hf_dataset.py --db-path AudioBooks/Catalog/DB/gutenbergindex.db --all-splits
 ```
 
 This script uses the existing `downloadlinks` table in `gutenbergindex.db` and downloads books directly from Project Gutenberg mirrors. It does not require cloning any external repository.
@@ -186,7 +186,7 @@ Arguments:
 - `--workers <n>`: number of concurrent file-index fetches.
 - `--limit <n>`: scan only the first `n` Gutenberg books, which is useful for testing.
 
-This mode updates the local cache in SQLite so later runs of `backfill_missing_books.py` can see more formats without cloning another repository.
+This mode updates the local cache in SQLite so later runs of `backfill_missing_book_contents.py` can see more formats without cloning another repository.
 
 ### Audio catalog backfill
 

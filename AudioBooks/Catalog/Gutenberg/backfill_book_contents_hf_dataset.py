@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import sqlite3
 from pathlib import Path
 
 from datasets import Dataset, DatasetDict, load_dataset, load_dataset_builder
 from dotenv import load_dotenv
 from gutenbergpy.textget import strip_headers
+from AudioBooks.Catalog.Gutenberg.db_utils import (
+    connect_db as _connect_db,
+    ensure_book_contents_table as _ensure_book_contents_table,
+)
 
 
 DATASET_NAME = "manu/project_gutenberg"
@@ -90,7 +93,7 @@ def load_all_books_datasets() -> DatasetDict:
 
 
 def get_existing_gutenberg_ids(db_path: str) -> set[int]:
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     cur = conn.cursor()
     cur.execute("SELECT gutenbergbookid FROM books WHERE gutenbergbookid IS NOT NULL")
     ids = {int(row[0]) for row in cur.fetchall() if row[0] is not None}
@@ -99,7 +102,7 @@ def get_existing_gutenberg_ids(db_path: str) -> set[int]:
 
 
 def get_existing_book_content_ids(db_path: str) -> set[int]:
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     cur = conn.cursor()
     cur.execute("SELECT bookid FROM book_contents")
     ids = {int(row[0]) for row in cur.fetchall() if row[0] is not None}
@@ -108,7 +111,7 @@ def get_existing_book_content_ids(db_path: str) -> set[int]:
 
 
 def upsert_book_content(db_path: str, book_id: int, raw_text: str, clean_text: str) -> None:
-    conn = sqlite3.connect(db_path)
+    conn = _connect_db(db_path)
     cur = conn.cursor()
     cur.execute(
         """
@@ -119,7 +122,6 @@ def upsert_book_content(db_path: str, book_id: int, raw_text: str, clean_text: s
     )
     conn.commit()
     conn.close()
-
 
 def _import_one_dataset(
     dataset: Dataset,
