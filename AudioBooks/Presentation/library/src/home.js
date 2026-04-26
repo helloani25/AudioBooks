@@ -515,6 +515,7 @@ let recentCategoriesListEl = null;
 let recentCategoriesWrapEl = null;
 let recentlyPlayedPanelEl = null;
 let recentlyPlayedListEl = null;
+let lastSearchHadNoResults = false;
 
 const resetPagination = () => {
   currentPage = 1;
@@ -873,9 +874,13 @@ const updateSectionTitle = () => {
   if (categoryGridEl) categoryGridEl.style.display = isFeatured ? "grid" : "none";
 
   if (sectionTitle) {
-    sectionTitle.textContent = selectedCategory === "Featured"
-      ? (currentSearch ? `Search results for "${currentSearch}"` : "Most downloaded from Gutenberg")
-      : `Books in ${selectedCategory}`;
+    if (lastSearchHadNoResults && currentSearch) {
+      sectionTitle.textContent = `No results for "${currentSearch}" — showing popular titles`;
+    } else {
+      sectionTitle.textContent = selectedCategory === "Featured"
+        ? (currentSearch ? `Search results for "${currentSearch}"` : "Most downloaded from Gutenberg")
+        : `Books in ${selectedCategory}`;
+    }
   }
 };
 
@@ -930,8 +935,17 @@ const loadPage = async () => {
   const subject = selectedCategory === "Featured" ? null : selectedCategory;
   try {
     const { books, total } = await fetchBooks(subject, currentSearch);
-    totalPages = Math.max(1, Math.ceil(total / LIMIT));
-    renderDownloads(books, true);
+    if (currentSearch && books.length === 0) {
+      // No matches for the search — fall back to popular titles
+      lastSearchHadNoResults = true;
+      const fallback = await fetchBooks(null, null);
+      totalPages = Math.max(1, Math.ceil(fallback.total / LIMIT));
+      renderDownloads(fallback.books, true);
+    } else {
+      lastSearchHadNoResults = false;
+      totalPages = Math.max(1, Math.ceil(total / LIMIT));
+      renderDownloads(books, true);
+    }
     renderPagination();
     updateSectionTitle();
   } catch (error) {
