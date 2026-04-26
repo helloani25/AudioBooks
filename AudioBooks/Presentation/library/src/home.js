@@ -5,6 +5,7 @@ const currentUrl = new URL(window.location.href);
 const bookIdParam = currentUrl.searchParams.get("book");
 const isRecentView = currentUrl.searchParams.get("view") === "recent";
 const initialCategoryParam = currentUrl.searchParams.get("category");
+const initialSearchParam = currentUrl.searchParams.get("search");
 const returnTarget = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 if (bookIdParam) {
   window.location.replace(`/book.html?book=${encodeURIComponent(bookIdParam)}`);
@@ -976,6 +977,12 @@ const initHomeView = async () => {
     allSubjects = await subjectsRes.json();
     if (initialCategoryParam) {
       selectedCategory = initialCategoryParam;
+    }
+
+    // Initialize search from URL if provided
+    if (initialSearchParam) {
+      currentSearch = initialSearchParam;
+      if (searchInput) searchInput.value = currentSearch;
     }
 
     await loadPage();
