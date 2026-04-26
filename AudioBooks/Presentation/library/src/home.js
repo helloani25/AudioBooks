@@ -1006,9 +1006,6 @@ const initHomeView = async () => {
     const tileScifi = document.getElementById("tile-scifi");
     const tileFiction = document.getElementById("tile-fiction");
 
-    const searchInput = document.querySelector(".search input");
-    const searchIcon = document.querySelector(".search-icon");
-
     const openCategory = async (category) => {
       selectedCategory = category;
       currentSearch = "";
