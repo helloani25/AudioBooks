@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
+import hashlib
+import json
 import re
 import sqlite3
 import ssl
@@ -13,12 +15,23 @@ from html.parser import HTMLParser
 from pathlib import Path
 from functools import lru_cache
 from urllib.parse import urljoin, urlsplit, urlunsplit
+import sys
 import xml.etree.ElementTree as ET
 import zipfile
 
-from gutenbergpy.textget import strip_headers
+try:
+    from gutenbergpy.textget import strip_headers
+except ImportError:  # pragma: no cover - optional dependency
+    def strip_headers(payload: bytes) -> bytes:
+        return payload
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from AudioBooks.Catalog.Gutenberg.db_utils import (
     connect_db as _connect_db,
+    ensure_book_content_backfill_tables as _ensure_book_content_backfill_tables,
     ensure_book_contents_table as _ensure_book_contents_table,
     with_sqlite_retry as _with_sqlite_retry,
 )
@@ -69,6 +82,7 @@ DB_PATH = BASE_DIR.parent / "DB" / "gutenbergindex.db"
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI flags for queue seeding, discovery caching, and repair modes."""
     parser = argparse.ArgumentParser(
         description="Backfill book_contents with missing Project Gutenberg texts from the local Gutenberg catalog.",
     )
@@ -89,6 +103,23 @@ def parse_args() -> argparse.Namespace:
         help="Download and parse books without writing to SQLite.",
     )
     parser.add_argument(
+        "--gutenberg-id",
+        dest="gutenberg_ids",
+        action="append",
+        type=int,
+        help="Target a specific Gutenberg id. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing book_contents rows for targeted ids.",
+    )
+    parser.add_argument(
+        "--repair-all",
+        action="store_true",
+        help="Scan every catalog book with a Gutenberg id and rewrite book_contents from the live Gutenberg source.",
+    )
+    parser.add_argument(
         "--preflight",
         action="store_true",
         help="Classify missing books before downloading and prefer live index candidates for repair/refresh cases.",
@@ -99,10 +130,26 @@ def parse_args() -> argparse.Namespace:
         help="Print the preflight classification and exit without downloading.",
     )
     parser.add_argument(
+        "--reset-queue",
+        action="store_true",
+        help="Discard any saved queue state for the selected run before starting.",
+    )
+    parser.add_argument(
+        "--refresh-discovery-cache",
+        action="store_true",
+        help="Ignore cached live-index and candidate discovery results and rebuild them.",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=8,
         help="Number of concurrent download workers.",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=3,
+        help="How many failed attempts to keep in the resumable queue before pausing a book.",
     )
     parser.add_argument(
         "--mirror-tries",
@@ -114,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         "--chunk-size",
         type=int,
         default=500,
-        help="How many Gutenberg ids to resolve per SQL batch when finding download links.",
+        help="How many books to keep in flight per batch when resolving candidates and downloading.",
     )
     parser.add_argument(
         "--ca-bundle",
@@ -137,6 +184,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def _decode_text_bytes(text_bytes: bytes) -> str:
+    """Decode Gutenberg payload bytes using a small encoding fallback chain."""
     detected = chardet.detect(text_bytes).get("encoding") if chardet else None
     for encoding in (detected, "utf-8", "cp1252", "latin-1"):
         if not encoding:
@@ -149,6 +197,7 @@ def _decode_text_bytes(text_bytes: bytes) -> str:
 
 
 def _tex_bytes_to_text(tex_bytes: bytes) -> str:
+    """Strip common TeX markup so archived `.tex` downloads become readable text."""
     text = _decode_text_bytes(tex_bytes)
     replacements = {
         r"\\%": "%",
@@ -170,6 +219,7 @@ def _tex_bytes_to_text(tex_bytes: bytes) -> str:
 
 
 def _pdf_bytes_to_text(pdf_bytes: bytes) -> str:
+    """Extract text from a Gutenberg PDF fallback when the PDF parser is installed."""
     if PdfReader is None:
         raise RuntimeError(
             "PDF fallback requires the optional 'pypdf' dependency. "
@@ -193,6 +243,7 @@ def _pdf_bytes_to_text(pdf_bytes: bytes) -> str:
 
 
 def _get_book_title(db_path: str, gutenberg_id: int) -> str:
+    """Resolve a Gutenberg id to the catalog title used in logs and queue rows."""
     def query():
         conn = _connect_db(db_path)
         cur = conn.cursor()
@@ -212,18 +263,20 @@ def _get_book_title(db_path: str, gutenberg_id: int) -> str:
 
 
 def _looks_like_warning_text(text: str) -> bool:
+    """Detect Gutenberg warning pages so the importer does not save redirect stubs."""
     lower_text = text.lower()
     warning_markers = (
         "do not download",
         "obsolete format",
-        "warning",
         "see #",
         "alternative ids",
+        "redirect disabled",
     )
     return any(marker in lower_text for marker in warning_markers)
 
 
 def _looks_like_real_book_text(text: str) -> bool:
+    """Reject tiny or stub-like downloads before they are written into the catalog."""
     stripped = text.strip()
     if len(stripped) < MIN_BOOK_TEXT_CHARS:
         return False
@@ -234,15 +287,225 @@ def _looks_like_real_book_text(text: str) -> bool:
 
 
 def _chunked(values: list[int], size: int) -> list[list[int]]:
+    """Split a list into fixed-size batches for SQL and cache lookups."""
     return [values[index : index + size] for index in range(0, len(values), size)]
 
 
+def _queue_key_for_run(*, repair_all: bool, gutenberg_ids: list[int] | None) -> str:
+    """Build the stable queue namespace for the current backfill mode."""
+    # The queue key is the namespace for resumable state:
+    # - one namespace for repair-all runs
+    # - one namespace for the default missing-content run
+    # - one namespace per explicit targeted id set
+    # Seeding uses this key so reruns update the same rows instead of creating a new queue.
+    if repair_all:
+        return "repair-all:v2"
+    if gutenberg_ids:
+        normalized = ",".join(str(gid) for gid in sorted(set(gutenberg_ids)))
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+        return f"targeted:v2:{digest}"
+    return "missing:v2"
+
+
+def _cache_get_json(db_path: str, cache_key: str):
+    """Read a cached JSON payload from the discovery cache table."""
+    def query():
+        conn = _connect_db(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT payload FROM gutenberg_discovery_cache WHERE cache_key = ?", (cache_key,))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return json.loads(row[0])
+
+    return _with_sqlite_retry(query)
+
+
+def _cache_set_json(db_path: str, cache_key: str, payload) -> None:
+    """Store a JSON payload in the discovery cache table for reuse on reruns."""
+    def write():
+        conn = _connect_db(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO gutenberg_discovery_cache (cache_key, payload, download_date, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (cache_key, json.dumps(payload)),
+        )
+        conn.commit()
+        conn.close()
+
+    _with_sqlite_retry(write)
+
+
+def _queue_seed_books(
+    db_path: str,
+    queue_key: str,
+    target_books: list[tuple[int, int | None, str]],
+    *,
+    reset: bool = False,
+) -> None:
+    """Seed or refresh the resumable queue for the selected run namespace."""
+    # Each row is keyed by (queue_key, bookid), so the same namespace can be
+    # reseeded safely. Completed rows remain in place, and only the selected
+    # namespace is updated or reset.
+    def write():
+        conn = _connect_db(db_path)
+        cur = conn.cursor()
+        if reset:
+            cur.execute("DELETE FROM book_content_backfill_queue WHERE queue_key = ?", (queue_key,))
+        for priority, (book_id, gutenberg_id, title) in enumerate(target_books):
+            cur.execute(
+                """
+                INSERT INTO book_content_backfill_queue (
+                    queue_key,
+                    bookid,
+                    gutenbergbookid,
+                    title,
+                    priority,
+                    status,
+                    attempts,
+                    last_error,
+                    source_bookid,
+                    source_url,
+                    source_type,
+                    download_date,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(queue_key, bookid) DO UPDATE SET
+                    gutenbergbookid = excluded.gutenbergbookid,
+                    title = excluded.title,
+                    priority = excluded.priority,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (queue_key, book_id, gutenberg_id, title, priority),
+            )
+        conn.commit()
+        conn.close()
+
+    _with_sqlite_retry(write)
+
+
+def _load_queue_books(
+    db_path: str,
+    queue_key: str,
+    *,
+    max_attempts: int,
+) -> list[tuple[int, int | None, str, int, str, int]]:
+    """Load only unfinished queue rows that are still eligible for processing."""
+    def query():
+        conn = _connect_db(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT bookid, gutenbergbookid, title, priority, status, attempts
+            FROM book_content_backfill_queue
+            WHERE queue_key = ?
+              AND status IN ('pending', 'failed')
+              AND attempts < ?
+            ORDER BY priority, bookid
+            """,
+            (queue_key, max_attempts),
+        )
+        rows = [
+            (int(row[0]), int(row[1]) if row[1] is not None else None, row[2], int(row[3]), row[4], int(row[5]))
+            for row in cur.fetchall()
+        ]
+        conn.close()
+        return rows
+
+    return _with_sqlite_retry(query)
+
+
+def _update_queue_status(
+    db_path: str,
+    queue_key: str,
+    book_id: int,
+    *,
+    status: str,
+    attempt_delta: int = 0,
+    last_error: str | None = None,
+    source_bookid: int | None = None,
+    source_url: str | None = None,
+    source_type: str | None = None,
+) -> None:
+    """Persist the latest queue status so interrupted runs can resume cleanly."""
+    def write():
+        conn = _connect_db(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE book_content_backfill_queue
+            SET
+                status = ?,
+                attempts = attempts + ?,
+                last_error = ?,
+                source_bookid = ?,
+                source_url = ?,
+                source_type = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE queue_key = ? AND bookid = ?
+            """,
+            (status, attempt_delta, last_error, source_bookid, source_url, source_type, queue_key, book_id),
+        )
+        conn.commit()
+        conn.close()
+
+    _with_sqlite_retry(write)
+
+
+def _get_download_candidates_cached(db_path: str, gutenberg_id: int, *, refresh: bool = False) -> list[tuple[str, str]]:
+    """Fetch or cache the supported local download candidates for one Gutenberg id."""
+    cache_key = f"download-candidates:v2:{gutenberg_id}:supported"
+    if not refresh:
+        cached = _cache_get_json(db_path, cache_key)
+        if cached is not None:
+            return [tuple(item) for item in cached]
+    candidates = _get_download_candidates(db_path, gutenberg_id)
+    _cache_set_json(db_path, cache_key, candidates)
+    return candidates
+
+
+def _get_all_download_candidates_cached(db_path: str, gutenberg_id: int, *, refresh: bool = False) -> list[tuple[str, str]]:
+    """Fetch or cache every local download candidate for one Gutenberg id."""
+    cache_key = f"download-candidates:v2:{gutenberg_id}:all"
+    if not refresh:
+        cached = _cache_get_json(db_path, cache_key)
+        if cached is not None:
+            return [tuple(item) for item in cached]
+    candidates = _get_all_download_candidates(db_path, gutenberg_id)
+    _cache_set_json(db_path, cache_key, candidates)
+    return candidates
+
+
+def _fetch_live_file_index_links_cached(
+    db_path: str,
+    gutenberg_id: int,
+    *,
+    refresh: bool = False,
+) -> list[tuple[str, str]]:
+    """Fetch or cache the live Gutenberg file index for one Gutenberg id."""
+    cache_key = f"live-index:v2:{gutenberg_id}"
+    if not refresh:
+        cached = _cache_get_json(db_path, cache_key)
+        if cached is not None:
+            return [tuple(item) for item in cached]
+    live_links = _fetch_live_file_index_links(gutenberg_id)
+    _cache_set_json(db_path, cache_key, live_links)
+    return live_links
+
+
 class _HrefCollector(HTMLParser):
+    """Collect anchor hrefs from a Gutenberg directory listing page."""
     def __init__(self):
         super().__init__()
         self.hrefs: list[str] = []
 
     def handle_starttag(self, tag, attrs):
+        """Record anchor links so the importer can derive live download URLs."""
         if tag.lower() != "a":
             return
         for name, value in attrs:
@@ -256,10 +519,10 @@ LIVE_DOWNLOAD_TYPE_BY_SUFFIX = [
     ((".html.us-ascii", ".htm.us-ascii"), "text/html; charset=us-ascii"),
     ((".html", ".htm", ".xhtml"), "text/html"),
     ((".tei.utf-8", ".tei"), "application/prs.tei"),
+    ((".tex",), "application/prs.tex"),
     ((".epub", ".epub.noimages", ".epub.images"), "application/epub+zip"),
     ((".zip",), "application/octet-stream"),
     ((".pdf",), "application/pdf"),
-    ((".tex",), "application/prs.tex"),
     ((".mp3",), "audio/mpeg"),
     ((".ogg",), "audio/ogg"),
     ((".m4a", ".mp4"), "audio/mp4"),
@@ -274,6 +537,7 @@ LIVE_DOWNLOAD_TYPE_BY_SUFFIX = [
 
 
 def _infer_live_download_type(link_name: str) -> str | None:
+    """Map a Gutenberg file suffix to the downloader's content type."""
     lower_name = link_name.lower()
     for suffixes, download_type in LIVE_DOWNLOAD_TYPE_BY_SUFFIX:
         if lower_name.endswith(suffixes):
@@ -282,6 +546,7 @@ def _infer_live_download_type(link_name: str) -> str | None:
 
 
 def _is_live_content_url(url: str) -> bool:
+    """Filter directory entries down to real content files and ignore RDF or warnings."""
     path_name = Path(urlsplit(url).path).name.lower()
     if not path_name or path_name.endswith("/"):
         return False
@@ -292,6 +557,7 @@ def _is_live_content_url(url: str) -> bool:
 
 
 def _url_points_to_book_id(url: str, book_id: int) -> bool:
+    """Check whether a candidate URL appears to belong to the requested book id."""
     path = urlsplit(url).path
     needle = str(book_id)
     segments = [segment for segment in path.split("/") if segment]
@@ -312,6 +578,7 @@ def _url_points_to_book_id(url: str, book_id: int) -> bool:
 
 
 def _fetch_live_file_index_links(book_id: int) -> list[tuple[str, str]]:
+    """Scrape the live Gutenberg file index for content-bearing download links."""
     index_url = f"{GUTENBERG_FILES_URL}/{book_id}/"
     response = urllib.request.urlopen(index_url)
     try:
@@ -342,19 +609,23 @@ def _fetch_live_file_index_links(book_id: int) -> list[tuple[str, str]]:
 
 
 class _TextExtractor(HTMLParser):
+    """Fallback HTML text extractor used when lxml is unavailable."""
     def __init__(self):
         super().__init__()
         self.parts: list[str] = []
 
     def handle_data(self, data):
+        """Accumulate visible HTML text while discarding markup."""
         if data:
             self.parts.append(data)
 
     def get_text(self) -> str:
+        """Return the concatenated text captured from the HTML document."""
         return " ".join(part.strip() for part in self.parts if part.strip())
 
 
 def _html_bytes_to_text(html_bytes: bytes) -> str:
+    """Convert Gutenberg HTML downloads into plain text."""
     html_text = _decode_text_bytes(html_bytes)
     try:
         if lxml_html is not None:
@@ -367,6 +638,7 @@ def _html_bytes_to_text(html_bytes: bytes) -> str:
 
 
 def _xml_bytes_to_text(xml_bytes: bytes) -> str:
+    """Convert Gutenberg XML or TEI payloads into plain text."""
     try:
         root = ET.fromstring(xml_bytes)
         return " ".join(part.strip() for part in root.itertext() if part and part.strip())
@@ -375,6 +647,7 @@ def _xml_bytes_to_text(xml_bytes: bytes) -> str:
 
 
 def _archive_bytes_to_text(archive_bytes: bytes) -> str:
+    """Extract and concatenate readable text from EPUB or ZIP archives."""
     chunks: list[str] = []
     with zipfile.ZipFile(BytesIO(archive_bytes)) as archive:
         files = [
@@ -406,6 +679,7 @@ def _archive_bytes_to_text(archive_bytes: bytes) -> str:
 
 
 def _download_book_text(url: str, download_type: str) -> str:
+    """Download a Gutenberg asset and normalize it to plain text."""
     response = urllib.request.urlopen(url)
     try:
         payload = response.read()
@@ -431,6 +705,7 @@ def _download_book_text(url: str, download_type: str) -> str:
 
 @lru_cache(maxsize=1)
 def _get_mirrors() -> list[str]:
+    """Fetch and cache the current list of Project Gutenberg mirrors."""
     response = urllib.request.urlopen(MIRRORS_URL)
     try:
         payload = response.read().decode("utf-8", errors="ignore")
@@ -445,12 +720,14 @@ def _get_mirrors() -> list[str]:
 
 
 def _mirror_url(url: str, mirror: str) -> str:
+    """Rewrite a Gutenberg URL to point at a specific mirror host."""
     source = urlsplit(url)
     target = urlsplit(mirror)
     return urlunsplit((target.scheme, target.netloc, source.path, source.query, source.fragment))
 
 
 def _resolve_ca_paths(cli_cafile, cli_capath, verify=True):
+    """Resolve TLS certificate inputs before installing the HTTPS opener."""
     if not verify:
         return None, None
 
@@ -473,6 +750,7 @@ def _resolve_ca_paths(cli_cafile, cli_capath, verify=True):
 
 
 def _install_https_opener(cafile, capath, verify=True):
+    """Install a shared HTTPS opener with the requested certificate policy."""
     if not verify:
         context = ssl._create_unverified_context()
     else:
@@ -485,23 +763,76 @@ def _install_https_opener(cafile, capath, verify=True):
     ssl._create_default_https_context = lambda: context
 
 
-def _get_missing_books(db_path: str) -> list[tuple[int, str]]:
+def _get_missing_books(db_path: str) -> list[tuple[int, int | None, str]]:
+    """Return catalog books that still lack internal book_contents rows."""
     def query():
         conn = _connect_db(db_path)
         cur = conn.cursor()
         cur.execute(
             """
             SELECT
+                b.id,
                 b.gutenbergbookid,
                 COALESCE((SELECT t.name FROM titles t WHERE t.bookid = b.id LIMIT 1), 'Untitled') AS title
             FROM books b
-            LEFT JOIN book_contents bc ON bc.bookid = b.gutenbergbookid
+            LEFT JOIN book_contents bc ON bc.bookid = b.id
             WHERE b.gutenbergbookid IS NOT NULL
               AND bc.bookid IS NULL
             ORDER BY b.numdownloads DESC
             """
         )
-        rows = [(int(row[0]), row[1]) for row in cur.fetchall()]
+        rows = [(int(row[0]), int(row[1]) if row[1] is not None else None, row[2]) for row in cur.fetchall()]
+        conn.close()
+        return rows
+
+    return _with_sqlite_retry(query)
+
+
+def _get_all_books(db_path: str) -> list[tuple[int, int | None, str]]:
+    """Return every catalog book that has a Gutenberg id for repair-all runs."""
+    def query():
+        conn = _connect_db(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                b.id,
+                b.gutenbergbookid,
+                COALESCE((SELECT t.name FROM titles t WHERE t.bookid = b.id LIMIT 1), 'Untitled') AS title
+            FROM books b
+            WHERE b.gutenbergbookid IS NOT NULL
+            ORDER BY b.numdownloads DESC
+            """
+        )
+        rows = [(int(row[0]), int(row[1]) if row[1] is not None else None, row[2]) for row in cur.fetchall()]
+        conn.close()
+        return rows
+
+    return _with_sqlite_retry(query)
+
+
+def _get_target_books(db_path: str, gutenberg_ids: list[int]) -> list[tuple[int, int | None, str]]:
+    """Return the explicit subset of books requested by Gutenberg id."""
+    if not gutenberg_ids:
+        return []
+
+    def query():
+        conn = _connect_db(db_path)
+        cur = conn.cursor()
+        placeholders = ",".join(["?"] * len(gutenberg_ids))
+        cur.execute(
+            f"""
+            SELECT
+                b.id,
+                b.gutenbergbookid,
+                COALESCE((SELECT t.name FROM titles t WHERE t.bookid = b.id LIMIT 1), 'Untitled') AS title
+            FROM books b
+            WHERE b.gutenbergbookid IN ({placeholders})
+            ORDER BY b.id
+            """,
+            gutenberg_ids,
+        )
+        rows = [(int(row[0]), int(row[1]) if row[1] is not None else None, row[2]) for row in cur.fetchall()]
         conn.close()
         return rows
 
@@ -509,6 +840,7 @@ def _get_missing_books(db_path: str) -> list[tuple[int, str]]:
 
 
 def _get_download_candidates(db_path: str, gutenberg_id: int) -> list[tuple[str, str]]:
+    """Return locally cached supported download links for one Gutenberg id."""
     def query():
         conn = _connect_db(db_path)
         cur = conn.cursor()
@@ -534,6 +866,7 @@ def _get_download_candidates(db_path: str, gutenberg_id: int) -> list[tuple[str,
 
 
 def _get_all_download_candidates(db_path: str, gutenberg_id: int) -> list[tuple[str, str]]:
+    """Return every cached download link for one Gutenberg id, including unsupported ones."""
     def query():
         conn = _connect_db(db_path)
         cur = conn.cursor()
@@ -561,6 +894,7 @@ def _get_download_candidates_for_books(
     *,
     chunk_size: int = 500,
 ) -> dict[int, list[tuple[str, str]]]:
+    """Batch-fetch supported download candidates for many Gutenberg ids at once."""
     if not gutenberg_ids:
         return {}
 
@@ -602,6 +936,7 @@ def _get_all_download_candidates_for_books(
     *,
     chunk_size: int = 500,
 ) -> dict[int, list[tuple[str, str]]]:
+    """Batch-fetch all cached download candidates for many Gutenberg ids at once."""
     if not gutenberg_ids:
         return {}
 
@@ -634,6 +969,7 @@ def _get_all_download_candidates_for_books(
 
 
 def _save_book_content(db_path: str, book_id: int, raw_text: str, clean_text: str) -> None:
+    """Write the canonical text payload for a book into book_contents."""
     def write():
         conn = _connect_db(db_path)
         cur = conn.cursor()
@@ -652,16 +988,20 @@ def _save_book_content(db_path: str, book_id: int, raw_text: str, clean_text: st
 
 
 def _is_audio_or_video_type(download_type: str) -> bool:
+    """Return True when a candidate is not text and should not be imported here."""
     return download_type.startswith("audio/") or download_type.startswith("video/")
 
 
 def _classify_preflight_book(
     db_path: str,
     book_id: int,
+    gutenberg_id: int | None,
     title: str,
-    local_supported: list[tuple[str, str]],
-    local_all: list[tuple[str, str]],
+    *,
+    refresh_cache: bool = False,
 ) -> dict:
+    """Decide whether a book should be repaired, refreshed, skipped, or treated as audio-only."""
+    local_supported = _get_download_candidates_cached(db_path, gutenberg_id, refresh=refresh_cache) if gutenberg_id is not None else []
     if local_supported:
         return {
             "book_id": book_id,
@@ -671,7 +1011,8 @@ def _classify_preflight_book(
             "candidates": local_supported,
         }
 
-    live_candidates = _fetch_live_file_index_links(book_id)
+    local_all = _get_all_download_candidates_cached(db_path, gutenberg_id, refresh=refresh_cache) if gutenberg_id is not None else []
+    live_candidates = _fetch_live_file_index_links_cached(db_path, gutenberg_id, refresh=refresh_cache) if gutenberg_id is not None else []
     if not live_candidates:
         if local_all and any(_url_points_to_book_id(url, book_id) for url, _ in local_all):
             reason = "local_links_present_but_no_live_content_discovered"
@@ -712,7 +1053,148 @@ def _classify_preflight_book(
     }
 
 
+def _process_backfill_queue_item(
+    db_path: str,
+    queue_key: str,
+    book_id: int,
+    gutenberg_id: int | None,
+    title: str,
+    *,
+    mirrors: list[str],
+    repair_all: bool,
+    preflight: bool,
+    refresh_cache: bool,
+    dry_run: bool,
+    mirror_tries: int,
+) -> dict:
+    """Process one queued book and update the resumable queue with the result."""
+    local_supported = _get_download_candidates_cached(db_path, gutenberg_id, refresh=refresh_cache) if gutenberg_id is not None else []
+    if repair_all:
+        local_all = _get_all_download_candidates_cached(db_path, gutenberg_id, refresh=refresh_cache) if gutenberg_id is not None else []
+        live_candidates = _fetch_live_file_index_links_cached(db_path, gutenberg_id, refresh=refresh_cache) if gutenberg_id is not None else []
+        if live_candidates:
+            has_audio_only = all(_is_audio_or_video_type(download_type) for _, download_type in live_candidates)
+            if has_audio_only:
+                plan = {
+                    "book_id": book_id,
+                    "title": title,
+                    "action": "audio-only",
+                    "reason": "live_index_contains_audio_only",
+                    "candidates": [],
+                }
+            else:
+                action = "repair" if local_all and all(
+                    not _url_points_to_book_id(url, book_id) for url, _ in local_all
+                ) else "refresh"
+                plan = {
+                    "book_id": book_id,
+                    "title": title,
+                    "action": action,
+                    "reason": "stale_local_links_replaced_from_live_index" if action == "repair" else "live_index_backfill",
+                    "candidates": live_candidates,
+                }
+        elif local_supported:
+            plan = {
+                "book_id": book_id,
+                "title": title,
+                "action": "download",
+                "reason": "local_supported_candidates_available",
+                "candidates": local_supported,
+            }
+        else:
+            plan = {
+                "book_id": book_id,
+                "title": title,
+                "action": "skip",
+                "reason": "no_live_content_discovered",
+                "candidates": [],
+            }
+    elif preflight:
+        plan = _classify_preflight_book(
+            db_path,
+            book_id,
+            gutenberg_id,
+            title,
+            refresh_cache=refresh_cache,
+        )
+    else:
+        plan = {
+            "book_id": book_id,
+            "title": title,
+            "action": "download" if local_supported else "skip",
+            "reason": "local_supported_candidates_available" if local_supported else "preflight_disabled",
+            "candidates": local_supported,
+        }
+
+    action = plan.get("action", "skip")
+    candidates = plan.get("candidates", [])
+
+    if action in {"skip", "audio-only"} or not candidates:
+        if not dry_run:
+            _update_queue_status(
+                db_path,
+                queue_key,
+                book_id,
+                status="skipped",
+                last_error=plan.get("reason") or "no supported download links",
+            )
+        return {
+            "status": "no_candidate" if not candidates else action,
+            "book_id": book_id,
+            "title": title,
+            "reason": plan.get("reason") or "no supported download links",
+        }
+
+    source_book_id = gutenberg_id or book_id
+    result = _download_missing_book(
+        db_path,
+        mirrors,
+        book_id,
+        source_book_id,
+        title,
+        candidates,
+        mirror_tries,
+    )
+
+    if result["status"] == "success":
+        if not dry_run:
+            _save_book_content(db_path, book_id, result["raw_text"], result["clean_text"])
+            _update_queue_status(
+                db_path,
+                queue_key,
+                book_id,
+                status="done",
+                source_bookid=result.get("source_book_id", source_book_id),
+                source_url=result.get("source_url"),
+                source_type=result.get("source_type"),
+            )
+        return result
+
+    if result["status"] == "no_candidate":
+        if not dry_run:
+            _update_queue_status(
+                db_path,
+                queue_key,
+                book_id,
+                status="skipped",
+                last_error="no supported download links",
+            )
+        return result
+
+    if not dry_run:
+        _update_queue_status(
+            db_path,
+            queue_key,
+            book_id,
+            status="failed",
+            attempt_delta=1,
+            last_error=str(result.get("error") or "no parseable download"),
+        )
+    return result
+
+
 def _rotate_list(values: list[str], offset: int) -> list[str]:
+    """Rotate a list so mirror selection spreads load across hosts."""
     if not values:
         return values
     offset %= len(values)
@@ -729,6 +1211,7 @@ def _download_missing_book(
     mirror_tries: int,
     seen_source_ids: set[int] | None = None,
 ) -> dict:
+    """Download, validate, and normalize one Gutenberg text candidate."""
     if seen_source_ids is None:
         seen_source_ids = {source_book_id}
     if not candidates:
@@ -848,110 +1331,68 @@ def backfill(
     db_path: str,
     limit: int | None = None,
     dry_run: bool = False,
+    gutenberg_ids: list[int] | None = None,
+    force: bool = False,
+    repair_all: bool = False,
     preflight: bool = False,
     preflight_only: bool = False,
+    reset_queue: bool = False,
+    refresh_discovery_cache: bool = False,
     workers: int = 8,
+    max_attempts: int = 3,
     mirror_tries: int = 3,
     chunk_size: int = 500,
 ) -> None:
+    # Flow:
+    # 1. Seed a durable queue row for each target book under a stable namespace.
+    # 2. Reload only unfinished queue rows so reruns resume instead of restarting.
+    # 3. Use cached discovery data first, then live Gutenberg fetches when needed.
+    # 4. Download, validate, and write book contents by internal books.id.
+    # 5. Persist queue status so done/skipped/failed work survives the next run.
+    #
+    # Mode mapping:
+    # - default run: missing-content queue, local candidates first
+    # - preflight: classify repair/refresh/skip/audio-only without committing content
+    # - repair-all: full sweep with live discovery; choose repair vs refresh per book
+    # - targeted ids: one hashed namespace for the exact Gutenberg id set
+    """Seed the queue, reuse cached discovery, and backfill book_contents."""
     _ensure_book_contents_table(db_path)
-    print("stage: scanning catalog for missing books", flush=True)
-    missing_books = _get_missing_books(db_path)
-    if limit is not None:
-        missing_books = missing_books[:limit]
-
-    print("stage: loading Project Gutenberg mirrors", flush=True)
-    mirrors = _get_mirrors()
-    print(f"summary: missing_books={len(missing_books)}", flush=True)
-    print(f"summary: mirrors_loaded={len(mirrors)}", flush=True)
-    book_ids = [book_id for book_id, _ in missing_books]
-    local_supported_by_book = _get_download_candidates_for_books(
-        db_path,
-        book_ids,
-        chunk_size=chunk_size,
-    )
-
-    planned_by_book: dict[int, dict] = {}
-    if preflight or preflight_only:
-        print("stage: preflight classifying missing books", flush=True)
-        local_all_by_book = _get_all_download_candidates_for_books(
-            db_path,
-            book_ids,
-            chunk_size=chunk_size,
-        )
-        counts = {"repair": 0, "refresh": 0, "audio-only": 0, "skip": 0}
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-            futures = {
-                executor.submit(
-                    _classify_preflight_book,
-                    db_path,
-                    book_id,
-                    title,
-                    local_supported_by_book.get(book_id, []),
-                    local_all_by_book.get(book_id, []),
-                ): (book_id, title)
-                for book_id, title in missing_books
-            }
-
-            for future in as_completed(futures):
-                book_id, title = futures[future]
-                try:
-                    plan = future.result()
-                except Exception as exc:
-                    counts["skip"] += 1
-                    planned_by_book[book_id] = {
-                        "book_id": book_id,
-                        "title": title,
-                        "action": "skip",
-                        "reason": f"preflight_failed: {exc}",
-                        "candidates": local_supported_by_book.get(book_id, []),
-                    }
-                    print(f"preflight {book_id}: action=skip reason=preflight_failed ({title})", flush=True)
-                    continue
-
-                planned_by_book[book_id] = plan
-                action = plan["action"]
-                counts[action] += 1
-                print(
-                    f"preflight {book_id}: action={action} reason={plan['reason']} "
-                    f"candidates={len(plan.get('candidates', []))} ({title})",
-                    flush=True,
-                )
-
-        print(
-            "preflight-summary: "
-            f"repair={counts['repair']}, refresh={counts['refresh']}, "
-            f"audio_only={counts['audio-only']}, skip={counts['skip']}",
-            flush=True,
-        )
-
-        if preflight_only:
-            return
+    _ensure_book_content_backfill_tables(db_path)
+    preflight = preflight or repair_all
+    print("stage: scanning catalog for books", flush=True)
+    if repair_all:
+        target_books = _get_all_books(db_path)
+    elif gutenberg_ids:
+        target_books = _get_target_books(db_path, gutenberg_ids)
     else:
-        for book_id, title in missing_books:
-            planned_by_book[book_id] = {
-                "book_id": book_id,
-                "title": title,
-                "action": "skip",
-                "reason": "preflight_disabled",
-                "candidates": local_supported_by_book.get(book_id, []),
-            }
+        target_books = _get_missing_books(db_path)
+    if limit is not None:
+        target_books = target_books[:limit]
 
-    candidates_by_book: dict[int, list[tuple[str, str]]] = {}
-    for book_id, title in missing_books:
-        plan = planned_by_book.get(book_id, {})
-        action = plan.get("action", "skip")
-        if action in {"repair", "refresh"}:
-            candidates_by_book[book_id] = plan.get("candidates", [])
-        else:
-            candidates_by_book[book_id] = local_supported_by_book.get(book_id, [])
+    mirrors: list[str] = []
+    if mirror_tries > 0:
+        print("stage: loading Project Gutenberg mirrors", flush=True)
+        mirrors = _get_mirrors()
 
-    matched_books = sum(1 for candidates in candidates_by_book.values() if candidates)
+    queue_key = _queue_key_for_run(repair_all=repair_all, gutenberg_ids=gutenberg_ids)
+    # Seed rows under the namespace selected above, then reload the unfinished
+    # rows from that same namespace so interrupted runs can resume.
+    _queue_seed_books(db_path, queue_key, target_books, reset=reset_queue)
+
+    queue_rows = _load_queue_books(db_path, queue_key, max_attempts=max_attempts)
+    print(f"summary: target_books={len(target_books)} queue_key={queue_key}", flush=True)
+    print(f"summary: queued_books={len(queue_rows)}", flush=True)
+    print(f"summary: mirrors_loaded={len(mirrors)}", flush=True)
+    if preflight:
+        print("stage: cached discovery is enabled for live index and per-book candidates", flush=True)
+    if preflight_only:
+        print("stage: preflight-only requested; no downloads will run", flush=True)
+        return
+
     print(
-        f"summary: download_links_resolved={matched_books}/{len(missing_books)}",
+        f"stage: downloading with workers={max(1, workers)} mirror_tries={mirror_tries} chunk_size={max(1, chunk_size)}",
         flush=True,
     )
-    print(f"stage: downloading with workers={max(1, workers)} mirror_tries={mirror_tries}", flush=True)
 
     processed = 0
     matched = 0
@@ -960,61 +1401,65 @@ def backfill(
     skipped_no_candidate = 0
     failed = 0
 
+    batch_size = max(1, chunk_size)
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = {
-            # Use the preflight title when available so repair/refresh cases stay traceable.
-            executor.submit(
-                _download_missing_book,
-                db_path,
-                mirrors,
-                book_id,
-                book_id,
-                planned_by_book.get(book_id, {}).get("title", title),
-                candidates_by_book.get(book_id, []),
-                mirror_tries,
-            ): (book_id, title)
-            for book_id, title in missing_books
-        }
+        for queue_batch in _chunked(queue_rows, batch_size):
+            futures = {
+                executor.submit(
+                    _process_backfill_queue_item,
+                    db_path,
+                    queue_key,
+                    book_id,
+                    gutenberg_id,
+                    title,
+                    mirrors=mirrors,
+                    repair_all=repair_all,
+                    preflight=preflight,
+                    refresh_cache=refresh_discovery_cache,
+                    dry_run=dry_run,
+                    mirror_tries=mirror_tries,
+                ): (book_id, title)
+                for book_id, gutenberg_id, title, _priority, _status, _attempts in queue_batch
+            }
 
-        for future in as_completed(futures):
-            processed += 1
-            book_id, title = futures[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                failed += 1
-                print(f"fail {book_id}: {exc} ({title})")
-                continue
+            for future in as_completed(futures):
+                processed += 1
+                book_id, title = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    failed += 1
+                    print(f"fail {book_id}: {exc} ({title})")
+                    continue
 
-            status = result["status"]
-            if status == "no_candidate":
-                skipped_no_candidate += 1
-                print(f"skip {book_id}: no supported download links ({title})")
-                continue
-            if status == "failed":
-                failed += 1
-                print(f"fail {book_id}: {result.get('error') or 'no parseable download'} ({title})")
-                continue
+                status = result["status"]
+                if status in {"no_candidate", "skip", "audio-only"}:
+                    skipped_no_candidate += 1
+                    print(f"skip {book_id}: {result.get('reason') or 'no supported download links'} ({title})")
+                    continue
+                if status == "failed":
+                    failed += 1
+                    print(f"fail {book_id}: {result.get('error') or 'no parseable download'} ({title})")
+                    continue
 
-            matched += 1
-            source_type = result["source_type"]
-            source_url = result.get("source_url", "")
-            source_book_id = result.get("source_book_id", book_id)
-            if dry_run:
-                previewed += 1
-                print(
-                    f"dry-run {book_id} using {source_type} from {source_url} "
-                    f"(source_book_id={source_book_id}): {title}",
-                    flush=True,
-                )
-            else:
-                _save_book_content(db_path, book_id, result["raw_text"], result["clean_text"])
-                written += 1
-                print(
-                    f"saved {book_id} using {source_type} from {source_url} "
-                    f"(source_book_id={source_book_id}): {title}",
-                    flush=True,
-                )
+                matched += 1
+                source_type = result["source_type"]
+                source_url = result.get("source_url", "")
+                source_book_id = result.get("source_book_id", book_id)
+                if dry_run:
+                    previewed += 1
+                    print(
+                        f"dry-run {book_id} using {source_type} from {source_url} "
+                        f"(source_book_id={source_book_id}): {title}",
+                        flush=True,
+                    )
+                else:
+                    written += 1
+                    print(
+                        f"saved {book_id} using {source_type} from {source_url} "
+                        f"(source_book_id={source_book_id}): {title}",
+                        flush=True,
+                    )
 
     print(
         "done: "
@@ -1024,6 +1469,7 @@ def backfill(
 
 
 def main() -> None:
+    """Entry point that wires CLI flags into the resumable backfill flow."""
     args = parse_args()
     cafile, capath = _resolve_ca_paths(args.cafile, args.capath, args.verify)
     _install_https_opener(cafile, capath, args.verify)
@@ -1031,9 +1477,15 @@ def main() -> None:
         args.db_path,
         limit=args.limit,
         dry_run=args.dry_run,
+        gutenberg_ids=args.gutenberg_ids,
+        force=args.force,
+        repair_all=args.repair_all,
         preflight=args.preflight,
         preflight_only=args.preflight_only,
+        reset_queue=args.reset_queue,
+        refresh_discovery_cache=args.refresh_discovery_cache,
         workers=args.workers,
+        max_attempts=args.max_attempts,
         mirror_tries=args.mirror_tries,
         chunk_size=args.chunk_size,
     )

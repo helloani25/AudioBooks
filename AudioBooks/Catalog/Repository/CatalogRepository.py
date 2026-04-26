@@ -1,8 +1,24 @@
+import html
 import sqlite3
-import redis
 import json
 import os
+import re
 from pathlib import Path
+
+try:
+    import redis
+except ImportError:  # pragma: no cover - optional dependency
+    redis = None
+
+_SEARCH_STOP_WORDS = frozenset([
+    "a", "an", "the", "of", "in", "on", "at", "to", "for", "and", "or",
+    "by", "from", "with", "as", "is", "it", "its", "be", "are", "was",
+])
+
+_DIGIT_TO_WORD = {
+    "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
+    "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
+}
 
 class CatalogRepository:
     def __init__(self):
@@ -13,18 +29,38 @@ class CatalogRepository:
         
         # Redis Caching Configuration
         redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
-        self.redis = redis.from_url(redis_url)
+        self.redis = None
         self.use_redis = False
-        try:
-            self.redis.ping()
-            self.use_redis = True
-            print(f"Connected to Redis at {redis_url} for Catalog caching.")
-        except Exception as e:
-            print(f"WARNING: Redis not available for Catalog caching. Error: {e}")
+        if redis is not None:
+            try:
+                self.redis = redis.from_url(redis_url)
+                self.redis.ping()
+                self.use_redis = True
+                print(f"Connected to Redis at {redis_url} for Catalog caching.")
+            except Exception as e:
+                self.redis = None
+                print(f"WARNING: Redis not available for Catalog caching. Error: {e}")
+        else:
+            print("WARNING: Redis package not installed; using in-memory catalog cache.")
         
         self._books_cache = {}
         self._subjects_cache = {}
         self._ensure_audio_tables()
+
+    def _tokenize_search(self, query: str) -> list[str]:
+        """Split a search query into normalized tokens with digit→word expansion and stop-word removal."""
+        raw = re.split(r'\W+', query.lower().strip())
+        seen: set[str] = set()
+        tokens: list[str] = []
+        for tok in raw:
+            if not tok or len(tok) < 2:
+                continue
+            tok = _DIGIT_TO_WORD.get(tok, tok)
+            if tok not in seen:
+                seen.add(tok)
+                tokens.append(tok)
+        filtered = [t for t in tokens if t not in _SEARCH_STOP_WORDS]
+        return filtered if filtered else tokens
 
     def _extract_year(self, date_str: str | None) -> int | None:
         if not date_str:
@@ -45,6 +81,88 @@ class CatalogRepository:
             return True
         # Keep if it has more than 2 characters and contains no digits (likely common word)
         return len(s) > 2 and not any(char.isdigit() for char in s)
+
+    def _normalize_match_text(self, value: str | None) -> str:
+        if not value:
+            return ""
+        normalized = str(value).encode("ascii", errors="ignore").decode("ascii")
+        normalized = re.sub(r"[^a-z0-9]+", " ", normalized.lower())
+        return " ".join(normalized.split())
+
+    def _token_set(self, value: str | None) -> set[str]:
+        return {token for token in self._normalize_match_text(value).split() if len(token) > 2}
+
+    def _text_matches(self, expected: str | None, candidate: str | None, *, threshold: float = 0.8) -> bool:
+        expected_norm = self._normalize_match_text(expected)
+        candidate_norm = self._normalize_match_text(candidate)
+        if not expected_norm or not candidate_norm:
+            return False
+        if expected_norm == candidate_norm:
+            return True
+        if expected_norm in candidate_norm or candidate_norm in expected_norm:
+            return True
+
+        expected_tokens = self._token_set(expected)
+        candidate_tokens = self._token_set(candidate)
+        if not expected_tokens or not candidate_tokens:
+            return False
+        # Use min so that "Mark Twain" matching against "Twain, Mark|Clemens, Samuel..."
+        # scores 2/2 = 1.0 rather than 2/5 = 0.4 (catalog author lists are always larger).
+        overlap = len(expected_tokens & candidate_tokens) / min(len(expected_tokens), len(candidate_tokens))
+        return overlap >= threshold
+
+    def _load_catalog_book_metadata(self, book_id: int) -> dict | None:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                b.id AS bookid,
+                b.gutenbergbookid,
+                b.dateissued,
+                COALESCE((SELECT t.name FROM titles t WHERE t.bookid = b.id LIMIT 1), 'Untitled') AS title,
+                COALESCE((
+                    SELECT GROUP_CONCAT(name, '|')
+                    FROM (
+                        SELECT DISTINCT a.name AS name
+                        FROM authors a
+                        JOIN book_authors ba ON ba.authorid = a.id
+                        WHERE ba.bookid = b.id
+                        ORDER BY a.name
+                    )
+                ), '') AS authors
+            FROM books b
+            WHERE b.id = ?
+            """,
+            (book_id,),
+        )
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "bookid": int(row["bookid"]),
+            "gutenbergbookid": int(row["gutenbergbookid"]) if row["gutenbergbookid"] is not None else None,
+            "dateissued": row["dateissued"],
+            "title": row["title"] or "Untitled",
+            "authors": row["authors"] or "",
+        }
+
+    def _catalog_description_payload(self, catalog: dict) -> dict:
+        return {
+            "bookid": catalog["bookid"],
+            "wikipedia_id": None,
+            "freebase_id": None,
+            "source_title": catalog["title"] or "Untitled",
+            "source_author": (catalog["authors"] or None).replace("|", ", ") if catalog.get("authors") else None,
+            "publication_date": catalog.get("dateissued"),
+            "genres_text": None,
+            "genres_json": None,
+            "summary": "Description not available for this title.",
+            "source": "catalog",
+            "download_date": None,
+        }
 
     def _ensure_audio_tables(self) -> None:
         conn = sqlite3.connect(self.db_path)
@@ -95,13 +213,31 @@ class CatalogRepository:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS book_cover_art (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bookid INTEGER NOT NULL,
+                size_label TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                image_url TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                byte_size INTEGER,
+                rdf_url TEXT,
+                source TEXT NOT NULL DEFAULT 'gutenberg-rdf',
+                download_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(bookid, size_label, image_url)
+            )
+            """
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_book_audio_chapters_book_id ON book_audio_chapters(book_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_book_desc_wikipedia_id ON book_desc(wikipedia_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_book_cover_art_bookid ON book_cover_art(bookid)")
         conn.commit()
         conn.close()
 
     def get_books_count(self, subject: str = None, search: str = None) -> int:
-        cache_key = f"catalog:count:{subject or ''}:{search or ''}"
+        cache_key = f"catalog:count:v2:{subject or ''}:{search or ''}"
         if self.use_redis:
             cached_val = self.redis.get(cache_key)
             if cached_val is not None:
@@ -121,12 +257,13 @@ class CatalogRepository:
             params.append(subject)
 
         if search:
-            conditions.append("""
-                (b.id IN (SELECT bookid FROM titles WHERE name LIKE ?) 
-                 OR b.id IN (SELECT bookid FROM book_authors ba3 JOIN authors a3 ON a3.id = ba3.authorid WHERE a3.name LIKE ?))
-            """)
-            params.append(f"%{search}%")
-            params.append(f"%{search}%")
+            for token in self._tokenize_search(search):
+                like = f"%{token}%"
+                conditions.append("""
+                    (b.id IN (SELECT bookid FROM titles WHERE LOWER(name) LIKE ?)
+                     OR b.id IN (SELECT bookid FROM book_authors ba3 JOIN authors a3 ON a3.id = ba3.authorid WHERE LOWER(a3.name) LIKE ?))
+                """)
+                params.extend([like, like])
 
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
@@ -134,15 +271,15 @@ class CatalogRepository:
         cur.execute(query, params)
         count = cur.fetchone()[0]
         conn.close()
-        
+
         if self.use_redis:
-            self.redis.setex(cache_key, 3600, count) # Cache for 1 hour
+            self.redis.setex(cache_key, 3600, count)
         else:
             self._books_cache[cache_key] = count
         return count
 
     def get_books(self, subject: str = None, search: str = None, limit: int = 100, offset: int = 0):
-        cache_key = f"catalog:books:{subject or ''}:{search or ''}:{limit}:{offset}"
+        cache_key = f"catalog:books:v2:{subject or ''}:{search or ''}:{limit}:{offset}"
         if self.use_redis:
             cached_val = self.redis.get(cache_key)
             if cached_val is not None:
@@ -154,40 +291,49 @@ class CatalogRepository:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        # Build subqueries for authors and subjects using '|' separator to handle commas in names
-        query = """
-            SELECT 
+        tokens = self._tokenize_search(search) if search else []
+
+        # Build a per-token title-match score expression for ranking.
+        score_cases = " + ".join(
+            f"CASE WHEN LOWER((SELECT name FROM titles WHERE bookid = b.id LIMIT 1)) LIKE ? THEN 1 ELSE 0 END"
+            for _ in tokens
+        ) or "0"
+        score_params = [f"%{t}%" for t in tokens]
+
+        query = f"""
+            SELECT
                 b.id,
                 (SELECT t.name FROM titles t WHERE t.bookid = b.id LIMIT 1) AS title,
                 (SELECT GROUP_CONCAT(name, '|') FROM (SELECT DISTINCT a2.name as name FROM authors a2 JOIN book_authors ba2 ON ba2.authorid = a2.id WHERE ba2.bookid = b.id)) AS authors,
                 b.dateissued,
                 l.name AS language,
                 b.numdownloads,
-                (SELECT GROUP_CONCAT(name, '|') FROM (SELECT DISTINCT s2.name as name FROM subjects s2 JOIN book_subjects bs2 ON bs2.subjectid = s2.id WHERE bs2.bookid = b.id)) AS subjects
+                (SELECT GROUP_CONCAT(name, '|') FROM (SELECT DISTINCT s2.name as name FROM subjects s2 JOIN book_subjects bs2 ON bs2.subjectid = s2.id WHERE bs2.bookid = b.id)) AS subjects,
+                ({score_cases}) AS search_score
             FROM books b
             LEFT JOIN languages l ON l.id = b.languageid
         """
 
         conditions = []
-        params = []
+        params = list(score_params)
 
         if subject:
             conditions.append("b.id IN (SELECT bookid FROM book_subjects bs2 JOIN subjects s2 ON s2.id = bs2.subjectid WHERE s2.name = ?)")
             params.append(subject)
 
-        if search:
-            # When searching, we need subqueries to avoid complex joins and cartesian product issues
+        for token in tokens:
+            like = f"%{token}%"
             conditions.append("""
-                (b.id IN (SELECT bookid FROM titles WHERE name LIKE ?) 
-                 OR b.id IN (SELECT bookid FROM book_authors ba3 JOIN authors a3 ON a3.id = ba3.authorid WHERE a3.name LIKE ?))
+                (b.id IN (SELECT bookid FROM titles WHERE LOWER(name) LIKE ?)
+                 OR b.id IN (SELECT bookid FROM book_authors ba3 JOIN authors a3 ON a3.id = ba3.authorid WHERE LOWER(a3.name) LIKE ?))
             """)
-            params.append(f"%{search}%")
-            params.append(f"%{search}%")
+            params.extend([like, like])
 
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
 
-        query += " ORDER BY b.numdownloads DESC LIMIT ? OFFSET ?"
+        order_by = "search_score DESC, b.numdownloads DESC" if tokens else "b.numdownloads DESC"
+        query += f" ORDER BY {order_by} LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
         cur.execute(query, params)
@@ -218,8 +364,8 @@ class CatalogRepository:
         return items
 
     def get_subjects(self, limit: int = 50):
-        # Filtered set cover results are cached with a specific key
-        cache_key = f"catalog:subjects:set_cover_v2"
+        # Cache the ranked subject list separately from the book list caches.
+        cache_key = f"catalog:subjects:top_counts_v1:{limit}"
         if self.use_redis:
             cached_val = self.redis.get(cache_key)
             if cached_val is not None:
@@ -230,57 +376,31 @@ class CatalogRepository:
 
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        
-        # 1. Fetch all book-subject associations and subject names
-        cur.execute("SELECT bs.bookid, bs.subjectid, s.name FROM book_subjects bs JOIN subjects s ON s.id = bs.subjectid")
-        subject_to_books = {}
-        all_books_with_subjects = set()
-        for bookid, sid, name in cur.fetchall():
-            if not self._is_valid_subject(name):
-                continue
-            all_books_with_subjects.add(bookid)
-            if sid not in subject_to_books:
-                subject_to_books[sid] = set()
-            subject_to_books[sid].add(bookid)
-            
-        # 2. Greedy set cover
-        covered_books = set()
-        selected_subject_ids = []
-        remaining_subjects = {sid: books for sid, books in subject_to_books.items()}
-        
-        while covered_books < all_books_with_subjects:
-            best_sid = -1
-            max_new_coverage = 0
-            for sid, books in remaining_subjects.items():
-                new_coverage = len(books - covered_books)
-                if new_coverage > max_new_coverage:
-                    max_new_coverage = new_coverage
-                    best_sid = sid
-            
-            if best_sid == -1: break
-            
-            selected_subject_ids.append(best_sid)
-            covered_books.update(remaining_subjects[best_sid])
-            del remaining_subjects[best_sid]
-            
-        # 3. Get metadata for selected subjects
-        if not selected_subject_ids:
-            return []
-            
-        placeholders = ','.join(['?'] * len(selected_subject_ids))
-        cur.execute(f"SELECT id, name FROM subjects WHERE id IN ({placeholders})", selected_subject_ids)
-        id_to_name = {row[0]: row[1] for row in cur.fetchall()}
-        
-        # Also get counts for these subjects
-        cur.execute(f"SELECT subjectid, COUNT(bookid) FROM book_subjects WHERE subjectid IN ({placeholders}) GROUP BY subjectid", selected_subject_ids)
-        id_to_count = {row[0]: row[1] for row in cur.fetchall()}
+
+        cur.execute(
+            """
+            SELECT
+                s.name,
+                COUNT(DISTINCT bs.bookid) AS book_count
+            FROM book_subjects bs
+            JOIN subjects s ON s.id = bs.subjectid
+            WHERE s.name IS NOT NULL
+            GROUP BY s.id, s.name
+            ORDER BY book_count DESC, s.name ASC
+            """
+        )
+        rows = cur.fetchall()
         conn.close()
-        
-        # Order by the greedy selection order (importance for coverage)
+
+        if not rows:
+            return []
+
         result = [
-            {"name": id_to_name[sid], "count": id_to_count.get(sid, 0)}
-            for sid in selected_subject_ids if sid in id_to_name
+            {"name": name, "count": int(book_count)}
+            for name, book_count in rows
+            if self._is_valid_subject(name)
         ]
+        result = result[:limit]
         
         if self.use_redis:
             self.redis.setex(cache_key, 3600, json.dumps(result))
@@ -386,7 +506,11 @@ class CatalogRepository:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(
-            "SELECT book_id, package_url, audio_format, track_count, is_chaptered, download_date FROM book_audio WHERE book_id = ?",
+            """
+            SELECT book_id, package_url, audio_format, track_count, is_chaptered,
+                   narrator, narrator_source, is_synthesized, download_date
+            FROM book_audio WHERE book_id = ?
+            """,
             (book_id,),
         )
         summary = cur.fetchone()
@@ -396,7 +520,7 @@ class CatalogRepository:
 
         cur.execute(
             """
-            SELECT book_id, track_order, chapter_title, track_url, audio_format, download_date
+            SELECT book_id, track_order, chapter_title, track_url, audio_format, duration, download_date
             FROM book_audio_chapters
             WHERE book_id = ?
             ORDER BY track_order, id
@@ -411,6 +535,9 @@ class CatalogRepository:
             "audio_format": summary["audio_format"],
             "track_count": summary["track_count"],
             "is_chaptered": bool(summary["is_chaptered"]),
+            "narrator": summary["narrator"],
+            "narrator_source": summary["narrator_source"],
+            "is_synthesized": bool(summary["is_synthesized"]),
             "download_date": summary["download_date"],
             "chapters": chapters,
         }
@@ -463,7 +590,11 @@ class CatalogRepository:
         conn.commit()
         conn.close()
 
-    def get_book_desc(self, book_id: int):
+    def get_book_description(self, book_id: int):
+        catalog = self._load_catalog_book_metadata(book_id)
+        if catalog is None:
+            return None
+
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -488,4 +619,46 @@ class CatalogRepository:
         )
         row = cur.fetchone()
         conn.close()
-        return dict(row) if row else None
+        if row:
+            row_dict = dict(row)
+            if row_dict.get("source_author"):
+                row_dict["source_author"] = str(row_dict["source_author"]).replace("|", ", ")
+            if row_dict.get("summary"):
+                row_dict["summary"] = html.unescape(row_dict["summary"])
+            if self._text_matches(catalog["title"], row_dict.get("source_title")) and (
+                not row_dict.get("source_author")
+                or self._text_matches(catalog["authors"], row_dict.get("source_author"), threshold=0.5)
+            ):
+                return row_dict
+
+        return self._catalog_description_payload(catalog)
+
+    def get_book_desc(self, book_id: int):
+        return self.get_book_description(book_id)
+
+    def get_book_cover_art(self, book_id: int):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                bca.bookid,
+                bca.size_label,
+                bca.sort_order,
+                bca.image_url,
+                bca.mime_type,
+                bca.byte_size,
+                bca.rdf_url,
+                bca.source,
+                bca.download_date
+            FROM book_cover_art bca
+            JOIN books b ON b.gutenbergbookid = bca.bookid
+            WHERE b.id = ?
+            ORDER BY bca.sort_order, COALESCE(bca.byte_size, 0) DESC, bca.size_label, bca.image_url
+            """,
+            (book_id,),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+        conn.close()
+        return rows

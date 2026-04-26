@@ -165,7 +165,7 @@ def _resolve_ca_paths(cli_cafile, cli_capath, verify=True):
         return None, None
     cafile = (
         cli_cafile
-        or os.getenv("GUTTENBERG_CA_BUNDLE")
+        or os.getenv("GUTENBERG_CA_BUNDLE")
         or os.getenv("SSL_CERT_FILE")
         or os.getenv("REQUESTS_CA_BUNDLE")
         or os.getenv("CURL_CA_BUNDLE")
@@ -230,7 +230,7 @@ if __name__ == "__main__":
         if isinstance(exc, ssl.SSLCertVerificationError) or (isinstance(exc, urllib.error.URLError) and "CERTIFICATE_VERIFY_FAILED" in str(exc)):
              raise RuntimeError(
                 "TLS verification failed. Provide a trusted CA bundle path via "
-                "GUTTENBERG_CA_BUNDLE, SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, "
+                "GUTENBERG_CA_BUNDLE, SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, "
                 "or pass --ca-bundle/--ca-dir (and optionally SSL_CERT_DIR). "
                 "Alternatively, use --no-verify to disable verification (use with caution)."
             ) from exc

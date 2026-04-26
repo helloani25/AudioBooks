@@ -8,6 +8,7 @@ export default defineConfig({
         main: resolve(__dirname, "index.html"),
         signup: resolve(__dirname, "signup.html"),
         home: resolve(__dirname, "home.html"),
+        book: resolve(__dirname, "book.html"),
       },
     },
   },

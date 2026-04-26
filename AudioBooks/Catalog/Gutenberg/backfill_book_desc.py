@@ -5,11 +5,17 @@ import csv
 import json
 import re
 import sqlite3
+import sys
 import tarfile
 import unicodedata
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from AudioBooks.Catalog.Gutenberg.db_utils import connect_db as _connect_db
 

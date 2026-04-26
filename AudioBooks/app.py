@@ -1,7 +1,11 @@
 import os
 import sys
-import redis
 from datetime import timedelta
+
+try:
+    import redis
+except ImportError:  # pragma: no cover - optional dependency
+    redis = None
 
 # Ensure the project root is in sys.path so that absolute imports like 'from AudioBooks...' work
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -15,6 +19,7 @@ from flask_cors import CORS
 from werkzeug.security import check_password_hash
 from AudioBooks.Authentication.Repository.UserRepository import UserRepository
 from AudioBooks.Catalog.Service.CatalogService import catalog_bp
+from AudioBooks.MediaPlayer.Service.MediaHistoryService import media_history_bp
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev_key_only_for_internal_use')
@@ -25,15 +30,18 @@ app.config['SESSION_PERMANENT'] = True
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=15)
 app.config['SESSION_USE_SIGNER'] = True
 redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
-app.config['SESSION_REDIS'] = redis.from_url(redis_url)
-
-# Session fallback logic (moved here to run during app initialization)
-try:
-    app.config['SESSION_REDIS'].ping()
-    print(f"Connected to Redis at {redis_url} for sessions.")
-except Exception as e:
-    print(f"WARNING: Redis not available at {redis_url}. Error: {e}")
-    print("Falling back to filesystem for sessions. For production, please ensure a Redis server is running.")
+if redis is not None:
+    try:
+        app.config['SESSION_REDIS'] = redis.from_url(redis_url)
+        app.config['SESSION_REDIS'].ping()
+        print(f"Connected to Redis at {redis_url} for sessions.")
+    except Exception as e:
+        print(f"WARNING: Redis not available at {redis_url}. Error: {e}")
+        print("Falling back to filesystem for sessions. For production, please ensure a Redis server is running.")
+        app.config['SESSION_TYPE'] = 'filesystem'
+        app.config.pop('SESSION_REDIS', None)
+else:
+    print("WARNING: Redis package not installed. Falling back to filesystem sessions.")
     app.config['SESSION_TYPE'] = 'filesystem'
 
 # Secure Cookie Configuration
@@ -48,6 +56,7 @@ CORS(app, supports_credentials=True)
 
 # Register Blueprints
 app.register_blueprint(catalog_bp)
+app.register_blueprint(media_history_bp)
 
 user_repo = UserRepository()
 

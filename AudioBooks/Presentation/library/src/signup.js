@@ -3,10 +3,10 @@ import "./style.css";
 document.querySelector("#app").innerHTML = `
   <main class="page">
     <div class="panel">
-      <div class="brand">
+      <a class="brand brand-link" href="/home.html" aria-label="Go to homepage">
         <span class="brand-mark"></span>
         <span class="brand-name">AudioBooks</span>
-      </div>
+      </a>
       <h1>Start listening</h1>
       <p class="lead">
         Build your library in minutes. Track progress, save highlights, and

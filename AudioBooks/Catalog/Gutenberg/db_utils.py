@@ -10,6 +10,7 @@ T = TypeVar("T")
 
 
 def connect_db(db_path: str) -> sqlite3.Connection:
+    """Open SQLite with a long timeout so catalog backfills can coexist safely."""
     conn = sqlite3.connect(db_path, timeout=60)
     conn.execute("PRAGMA busy_timeout = 60000")
     return conn
@@ -21,6 +22,7 @@ def with_sqlite_retry(
     attempts: int = 8,
     initial_delay: float = 0.5,
 ) -> T:
+    """Retry SQLite writes when the database is temporarily locked or busy."""
     delay = initial_delay
     last_error: sqlite3.OperationalError | None = None
     for _ in range(attempts):
@@ -39,6 +41,7 @@ def with_sqlite_retry(
 
 
 def ensure_book_contents_table(db_path: str) -> None:
+    """Create the canonical text-content table used by all content backfills."""
     def query() -> None:
         conn = connect_db(db_path)
         try:
@@ -52,6 +55,86 @@ def ensure_book_contents_table(db_path: str) -> None:
                     download_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    with_sqlite_retry(query)
+
+
+def ensure_book_cover_art_table(db_path: str) -> None:
+    """Create the cover-art table used by the Gutenberg art backfill."""
+    def query() -> None:
+        conn = connect_db(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS book_cover_art (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    bookid INTEGER NOT NULL,
+                    size_label TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    image_url TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    byte_size INTEGER,
+                    rdf_url TEXT,
+                    source TEXT NOT NULL DEFAULT 'gutenberg-rdf',
+                    download_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(bookid, size_label, image_url)
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_book_cover_art_bookid ON book_cover_art(bookid)")
+            conn.commit()
+        finally:
+            conn.close()
+
+    with_sqlite_retry(query)
+
+
+def ensure_book_content_backfill_tables(db_path: str) -> None:
+    """Create queue and discovery-cache tables for resumable text backfills."""
+    def query() -> None:
+        conn = connect_db(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS book_content_backfill_queue (
+                    queue_key TEXT NOT NULL,
+                    bookid INTEGER NOT NULL,
+                    gutenbergbookid INTEGER,
+                    title TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    source_bookid INTEGER,
+                    source_url TEXT,
+                    source_type TEXT,
+                    download_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (queue_key, bookid)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gutenberg_discovery_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    download_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_backfill_queue_status ON book_content_backfill_queue(queue_key, status, priority)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_backfill_queue_gutenbergbookid ON book_content_backfill_queue(gutenbergbookid)"
             )
             conn.commit()
         finally:

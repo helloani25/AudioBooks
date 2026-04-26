@@ -28,6 +28,35 @@ def get_books_count():
     total = catalog_repo.get_books_count(subject=subject, search=search)
     return jsonify({'total': total})
 
+@catalog_bp.route('/api/books/<int:book_id>/description', methods=['GET'])
+def get_book_description(book_id: int):
+    description = catalog_repo.get_book_description(book_id)
+    if description is None:
+        return jsonify({'error': 'Book description not found'}), 404
+    return jsonify(description)
+
+@catalog_bp.route('/api/books/<int:book_id>/content', methods=['GET'])
+def get_book_content(book_id: int):
+    content = catalog_repo.get_book_content(book_id)
+    if content is None:
+        return jsonify({'error': 'Book content not found'}), 404
+    return jsonify(content)
+
+@catalog_bp.route('/api/books/<int:book_id>/audio', methods=['GET'])
+def get_book_audio(book_id: int):
+    audio = catalog_repo.get_book_audio(book_id)
+    if audio is None:
+        return jsonify({'error': 'Book audio not found'}), 404
+    return jsonify(audio)
+
+@catalog_bp.route('/api/books/<int:book_id>/cover-art', methods=['GET'])
+def get_book_cover_art(book_id: int):
+    cover_art = catalog_repo.get_book_cover_art(book_id)
+    return jsonify({
+        'book_id': book_id,
+        'covers': cover_art,
+    })
+
 @catalog_bp.route('/api/subjects', methods=['GET'])
 def get_subjects():
     limit = request.args.get('limit', default=50, type=int)

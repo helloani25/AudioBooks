@@ -3,11 +3,21 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 from pathlib import Path
 
 from datasets import Dataset, DatasetDict, load_dataset, load_dataset_builder
 from dotenv import load_dotenv
-from gutenbergpy.textget import strip_headers
+try:
+    from gutenbergpy.textget import strip_headers
+except ImportError:  # pragma: no cover - optional dependency
+    def strip_headers(payload: bytes) -> bytes:
+        return payload
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from AudioBooks.Catalog.Gutenberg.db_utils import (
     connect_db as _connect_db,
     ensure_book_contents_table as _ensure_book_contents_table,
@@ -58,6 +68,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Match dataset rows to DB books without writing to book_contents.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing book_contents rows and repair legacy Gutenberg-ID rows.",
+    )
     return parser.parse_args()
 
 
@@ -101,6 +116,21 @@ def get_existing_gutenberg_ids(db_path: str) -> set[int]:
     return ids
 
 
+def get_book_id_map(db_path: str) -> dict[int, int]:
+    conn = _connect_db(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, gutenbergbookid
+        FROM books
+        WHERE gutenbergbookid IS NOT NULL
+        """
+    )
+    mapping = {int(gutenbergbookid): int(book_id) for book_id, gutenbergbookid in cur.fetchall() if gutenbergbookid is not None}
+    conn.close()
+    return mapping
+
+
 def get_existing_book_content_ids(db_path: str) -> set[int]:
     conn = _connect_db(db_path)
     cur = conn.cursor()
@@ -123,6 +153,31 @@ def upsert_book_content(db_path: str, book_id: int, raw_text: str, clean_text: s
     conn.commit()
     conn.close()
 
+
+def delete_legacy_book_content(db_path: str, gutenberg_id: int, book_id: int) -> None:
+    if gutenberg_id == book_id:
+        return
+
+    conn = _connect_db(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        DELETE FROM book_contents
+        WHERE bookid = ?
+          AND EXISTS (
+              SELECT 1
+              FROM books b
+              WHERE b.gutenbergbookid = ?
+                AND b.id = ?
+                AND b.id != b.gutenbergbookid
+          )
+        """,
+        (gutenberg_id, gutenberg_id, book_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def _import_one_dataset(
     dataset: Dataset,
     db_path: str,
@@ -130,7 +185,9 @@ def _import_one_dataset(
     label: str = "",
     limit: int | None = None,
     dry_run: bool = False,
+    force: bool = False,
     existing_gutenberg_ids: set[int],
+    book_id_by_gutenberg_id: dict[int, int],
     existing_content_ids: set[int],
 ) -> dict[str, int]:
     prefix = f"[{label}] " if label else ""
@@ -161,9 +218,14 @@ def _import_one_dataset(
             skipped_missing += 1
             continue
 
+        book_id = book_id_by_gutenberg_id.get(gutenberg_id)
+        if book_id is None:
+            skipped_missing += 1
+            continue
+
         matched += 1
 
-        if gutenberg_id in existing_content_ids:
+        if not force and book_id in existing_content_ids:
             skipped_existing += 1
             continue
 
@@ -174,8 +236,10 @@ def _import_one_dataset(
             clean_text = raw_text
 
         if not dry_run:
-            upsert_book_content(db_path, gutenberg_id, raw_text, clean_text)
-            existing_content_ids.add(gutenberg_id)
+            upsert_book_content(db_path, book_id, raw_text, clean_text)
+            if force:
+                delete_legacy_book_content(db_path, gutenberg_id, book_id)
+            existing_content_ids.add(book_id)
         inserted += 1
 
         if inserted % 100 == 0:
@@ -200,8 +264,11 @@ def import_dataset(
     db_path: str,
     limit: int | None = None,
     dry_run: bool = False,
+    force: bool = False,
 ) -> None:
+    _ensure_book_contents_table(db_path)
     existing_gutenberg_ids = get_existing_gutenberg_ids(db_path)
+    book_id_by_gutenberg_id = get_book_id_map(db_path)
     existing_content_ids = get_existing_book_content_ids(db_path)
 
     total_stats = {
@@ -219,7 +286,9 @@ def import_dataset(
                 label=split_name,
                 limit=limit,
                 dry_run=dry_run,
+                force=force,
                 existing_gutenberg_ids=existing_gutenberg_ids,
+                book_id_by_gutenberg_id=book_id_by_gutenberg_id,
                 existing_content_ids=existing_content_ids,
             )
             for key in total_stats:
@@ -230,7 +299,9 @@ def import_dataset(
             db_path,
             limit=limit,
             dry_run=dry_run,
+            force=force,
             existing_gutenberg_ids=existing_gutenberg_ids,
+            book_id_by_gutenberg_id=book_id_by_gutenberg_id,
             existing_content_ids=existing_content_ids,
         )
 
@@ -255,7 +326,7 @@ def main() -> None:
         dataset = load_all_books_datasets()
     else:
         dataset = load_books_dataset(args.split or DEFAULT_SPLIT)
-    import_dataset(dataset, args.db_path, limit=args.limit, dry_run=args.dry_run)
+    import_dataset(dataset, args.db_path, limit=args.limit, dry_run=args.dry_run, force=args.force)
 
 
 if __name__ == "__main__":

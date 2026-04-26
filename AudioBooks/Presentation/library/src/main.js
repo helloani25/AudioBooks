@@ -1,12 +1,15 @@
 import "./style.css";
 
+const searchParams = new URLSearchParams(window.location.search);
+const nextTarget = searchParams.get("next");
+
 document.querySelector("#app").innerHTML = `
   <main class="page">
     <div class="panel">
-      <div class="brand">
+      <a class="brand brand-link" href="/home.html" aria-label="Go to homepage">
         <span class="brand-mark"></span>
         <span class="brand-name">AudioBooks</span>
-      </div>
+      </a>
       <h1>Welcome back</h1>
       <p class="lead">
         Pick up right where you left off. Sync your library, track progress, and
@@ -75,6 +78,13 @@ document.querySelector("#app").innerHTML = `
 const loginForm = document.querySelector(".form");
 const errorMessage = document.getElementById("error-message");
 
+const resolveRedirectTarget = () => {
+  if (nextTarget && nextTarget.startsWith("/")) {
+    return nextTarget;
+  }
+  return "/home.html";
+};
+
 loginForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   errorMessage.style.display = "none";
@@ -100,7 +110,7 @@ loginForm.addEventListener("submit", async (e) => {
 
     const result = await response.json();
     if (response.ok) {
-      window.location.href = result.redirect || "/home.html";
+      window.location.href = result.redirect || resolveRedirectTarget();
     } else {
       errorMessage.textContent = result.error || "Login failed";
       errorMessage.style.display = "block";
