@@ -4,10 +4,13 @@ import argparse
 import json
 import os
 import re
-import sqlite3
 from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import torch
 import torch.nn.functional as F
@@ -20,9 +23,18 @@ try:
 except ImportError:  # pragma: no cover
     BitsAndBytesConfig = None
 
+try:
+    from google.cloud import storage as gcs_storage
+    _HAS_GCS = True
+except ImportError:  # pragma: no cover
+    gcs_storage = None
+    _HAS_GCS = False
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR.parent / "AudioBook" / "Catalog" / "DB" / "gutenbergindex.db"
+
+GCS_BUCKET = os.environ.get("GCS_BUCKET")
+GCS_CONTENTS_PREFIX = "book-contents"
+GCS_DESC_PREFIX = "book-desc"
+CREDENTIALS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 DEFAULT_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 
 DEFAULT_CHUNK_TOKENS = 6000
@@ -61,9 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Chapter-by-chapter summarization harness for long books.",
     )
-    parser.add_argument("--db-path", default=str(DB_PATH), help="Path to gutenbergindex.db.")
     parser.add_argument("--book-id", type=int, help="Internal books.id to summarize.")
-    parser.add_argument("--gutenberg-id", type=int, help="Resolve the book by Gutenberg id.")
+    parser.add_argument("--gutenberg-id", type=int, help="Resolve by Gutenberg id using the GCS id map.")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="Hugging Face model id.")
     parser.add_argument("--chunk-tokens", type=int, default=DEFAULT_CHUNK_TOKENS)
     parser.add_argument("--chunk-overlap", type=int, default=DEFAULT_CHUNK_OVERLAP)
@@ -110,143 +121,91 @@ def parse_args() -> argparse.Namespace:
         help="Maximum contradiction probability allowed before treating the pair as contradictory.",
     )
     parser.add_argument("--output-path", default=None, help="Optional JSON output path.")
+    parser.add_argument(
+        "--bucket",
+        default=GCS_BUCKET,
+        help="GCS bucket containing uploaded book_contents (default: GCS_BUCKET from .env).",
+    )
+    parser.add_argument(
+        "--gcs-credentials",
+        default=CREDENTIALS_PATH,
+        metavar="KEY_FILE",
+        help="Service account JSON key file (default: GOOGLE_APPLICATION_CREDENTIALS from .env).",
+    )
     return parser.parse_args()
 
 
-def _connect_db(db_path: str) -> sqlite3.Connection:
-    """Open the SQLite catalog database with a busy timeout and row dict access."""
-    db_file = Path(db_path)
-    print(f"Connecting to catalog database at {db_file}")
-    if not db_file.is_file():
-        raise FileNotFoundError(
-            f"Catalog database not found at {db_file}. "
-            "Expected AudioBooks/Catalog/DB/gutenbergindex.db to exist before running this test."
-        )
-
-    conn = sqlite3.connect(str(db_file), timeout=60)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 60000")
-    return conn
+def _make_gcs_client(credentials_path: str | None = CREDENTIALS_PATH):
+    if not _HAS_GCS:
+        raise ImportError("google-cloud-storage is not installed. Run: pip install google-cloud-storage")
+    if credentials_path:
+        from google.oauth2 import service_account
+        creds = service_account.Credentials.from_service_account_file(credentials_path)
+        return gcs_storage.Client(credentials=creds)
+    return gcs_storage.Client()
 
 
-def _assert_books_schema(conn: sqlite3.Connection) -> None:
-    """Fail fast when the catalog database does not contain the expected books table."""
-    books_table = _resolve_books_table_name(conn)
-
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({books_table})")
-    columns = {str(row[1]) for row in cur.fetchall()}
-    if "gutenbergbookid" not in columns or "id" not in columns:
-        raise RuntimeError(
-            f"Catalog database schema in table {books_table!r} is missing required columns. "
-            f"Found columns: {sorted(columns)}"
-        )
-
-
-def _resolve_books_table_name(conn: sqlite3.Connection) -> str:
-    """Return the catalog table name used for book records."""
-    cur = conn.cursor()
-    for table_name in ("books", "book"):
-        cur.execute(
-            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?",
-            (table_name,),
-        )
-        if cur.fetchone() is not None:
-            return table_name
-
-    raise RuntimeError(
-        "Catalog database does not contain a book table named 'books' or 'book'. "
-        "Check that you are pointing at the expected gutenbergindex.db file."
-    )
-
-
-def _resolve_book_id(conn: sqlite3.Connection, book_id: int | None, gutenberg_id: int | None) -> int:
-    """Resolve the internal books.id from either a direct id or a Gutenberg id."""
-    books_table = _resolve_books_table_name(conn)
-    _assert_books_schema(conn)
-
-    if book_id is not None and gutenberg_id is not None:
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT id FROM {books_table} WHERE id = ? AND gutenbergbookid = ?",
-            (book_id, gutenberg_id),
-        )
-        row = cur.fetchone()
-        if row is None:
-            raise ValueError(f"book-id {book_id} does not match gutenberg-id {gutenberg_id}")
-        return int(row[0])
-
-    if book_id is not None:
+def _resolve_book_id(client, bucket_name: str, book_id: int | None, gutenberg_id: int | None) -> int:
+    """Resolve the internal book_id using the GCS gutenberg-id-map when needed."""
+    if book_id is not None and gutenberg_id is None:
         return book_id
 
     if gutenberg_id is not None:
-        cur = conn.cursor()
-        cur.execute(f"SELECT id FROM {books_table} WHERE gutenbergbookid = ?", (gutenberg_id,))
-        row = cur.fetchone()
-        if row is None:
-            raise ValueError(f"Could not resolve Gutenberg id {gutenberg_id}")
-        return int(row[0])
+        blob = client.bucket(bucket_name).blob(f"{GCS_DESC_PREFIX}/gutenberg-id-map.json")
+        if not blob.exists():
+            raise FileNotFoundError(
+                f"gutenberg-id-map not found at gs://{bucket_name}/{GCS_DESC_PREFIX}/gutenberg-id-map.json. "
+                "Run book_desc_upload.py first."
+            )
+        id_map: dict[str, int] = json.loads(blob.download_as_text(encoding="utf-8"))
+        resolved = id_map.get(str(gutenberg_id))
+        if resolved is None:
+            raise ValueError(f"Could not resolve Gutenberg id {gutenberg_id} from GCS id map.")
+        if book_id is not None and resolved != book_id:
+            raise ValueError(f"book-id {book_id} does not match gutenberg-id {gutenberg_id}")
+        return resolved
 
     raise ValueError("Provide either --book-id or --gutenberg-id")
 
 
-def _load_book_record(conn: sqlite3.Connection, book_id: int) -> BookRecord:
-    """Load title, authors, and full text for one catalog book."""
-    books_table = _resolve_books_table_name(conn)
-    cur = conn.cursor()
-    cur.execute(
-        f"""
-        SELECT
-            b.id AS book_id,
-            COALESCE((SELECT t.name FROM titles t WHERE t.bookid = b.id LIMIT 1), 'Untitled') AS title,
-            COALESCE((
-                SELECT GROUP_CONCAT(name, ', ')
-                FROM (
-                    SELECT DISTINCT a.name AS name
-                    FROM authors a
-                    JOIN book_authors ba ON ba.authorid = a.id
-                    WHERE ba.bookid = b.id
-                )
-            ), '') AS authors,
-            COALESCE(book_contents.clean_content, book_contents.raw_content, '') AS text
-        FROM {books_table} b
-        LEFT JOIN book_contents ON book_contents.bookid = b.id
-        WHERE b.id = ?
-        """,
-        (book_id,),
-    )
-    row = cur.fetchone()
-    if row is None:
-        raise ValueError(f"No book found for book id {book_id}")
+def _load_book_record(
+    client,
+    bucket_name: str,
+    book_id: int,
+) -> tuple[BookRecord, str | None]:
+    """Load title, authors, summary from GCS book-desc; load text from GCS book-contents.
 
-    text = (row["text"] or "").strip()
+    Returns (BookRecord, reference_summary). reference_summary is None when no
+    book_desc was uploaded yet — the similarity check is skipped in that case.
+    """
+    bucket = client.bucket(bucket_name)
+
+    # Load desc JSON
+    desc_blob = bucket.blob(f"{GCS_DESC_PREFIX}/{book_id}.json")
+    if desc_blob.exists():
+        desc = json.loads(desc_blob.download_as_text(encoding="utf-8"))
+        title = str(desc.get("source_title") or "Untitled").strip()
+        authors = str(desc.get("source_author") or "").replace("|", ", ").strip()
+        reference_summary = str(desc.get("summary") or "").strip() or None
+    else:
+        print(f"WARNING: no book-desc found for book_id={book_id}; run book_desc_upload.py", flush=True)
+        title, authors, reference_summary = "Untitled", "", None
+
+    # Load content
+    text = ""
+    for ext in ("txt", "html"):
+        blob = bucket.blob(f"{GCS_CONTENTS_PREFIX}/{book_id}/clean_content.{ext}")
+        if blob.exists():
+            print(f"stage: loading content from gs://{bucket_name}/{GCS_CONTENTS_PREFIX}/{book_id}/clean_content.{ext}", flush=True)
+            text = blob.download_as_text(encoding="utf-8").strip()
+            break
     if not text:
-        raise ValueError(f"No book text found for book id {book_id}")
+        raise FileNotFoundError(
+            f"No content found in GCS for book_id={book_id}. "
+            f"Run book_contents_upload.py first."
+        )
 
-    return BookRecord(
-        book_id=int(row["book_id"]),
-        title=str(row["title"] or "Untitled"),
-        authors=str(row["authors"] or ""),
-        text=text,
-    )
-
-
-def _load_book_desc_summary(conn: sqlite3.Connection, book_id: int) -> str | None:
-    """Fetch the stored summary text for the same book, if it exists."""
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT summary
-        FROM book_desc
-        WHERE bookid = ?
-        """,
-        (book_id,),
-    )
-    row = cur.fetchone()
-    if row is None:
-        return None
-    summary = str(row["summary"] or "").strip()
-    return summary or None
+    return BookRecord(book_id=book_id, title=title, authors=authors, text=text), reference_summary
 
 
 def _load_embedding_model(model_id: str, hf_token: str | None = None):
@@ -707,11 +666,14 @@ def main() -> None:
     args = parse_args()
     hf_token = os.getenv("HF_TOKEN")
 
-    conn = _connect_db(args.db_path)
-    book_id = _resolve_book_id(conn, args.book_id, args.gutenberg_id)
-    book = _load_book_record(conn, book_id)
-    book_desc_summary = _load_book_desc_summary(conn, book_id)
-    conn.close()
+    if not args.bucket:
+        raise ValueError("GCS_BUCKET is not set. Add it to .env or pass --bucket.")
+
+    print(f"stage: connecting to GCS bucket '{args.bucket}'", flush=True)
+    gcs_client = _make_gcs_client(args.gcs_credentials)
+
+    book_id = _resolve_book_id(gcs_client, args.bucket, args.book_id, args.gutenberg_id)
+    book, book_desc_summary = _load_book_record(gcs_client, args.bucket, book_id)
 
     print(f"stage: loading model {args.model_id}", flush=True)
     tokenizer, model = load_model(args.model_id, args.load_in_4bit, hf_token)
