@@ -35,6 +35,9 @@ from AudioBooks.Catalog.Gutenberg.db_utils import (
     ensure_book_contents_table as _ensure_book_contents_table,
     with_sqlite_retry as _with_sqlite_retry,
 )
+from AudioBooks.Catalog.Gutenberg.content_validation import (
+    detect_gutenberg_id_mismatch,
+)
 
 try:
     from lxml import html as lxml_html
@@ -79,6 +82,7 @@ MIRRORS_URL = "https://www.gutenberg.org/MIRRORS.ALL"
 GUTENBERG_FILES_URL = "https://www.gutenberg.org/files"
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR.parent / "DB" / "gutenbergindex.db"
+HTTP_TIMEOUT_SECONDS = 30
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,6 +122,11 @@ def parse_args() -> argparse.Namespace:
         "--repair-all",
         action="store_true",
         help="Scan every catalog book with a Gutenberg id and rewrite book_contents from the live Gutenberg source.",
+    )
+    parser.add_argument(
+        "--repair-mismatched-content",
+        action="store_true",
+        help="Rewrite books whose stored content advertises a different Gutenberg eBook id than books.gutenbergbookid.",
     )
     parser.add_argument(
         "--preflight",
@@ -268,7 +277,6 @@ def _looks_like_warning_text(text: str) -> bool:
     warning_markers = (
         "do not download",
         "obsolete format",
-        "see #",
         "alternative ids",
         "redirect disabled",
     )
@@ -286,20 +294,352 @@ def _looks_like_real_book_text(text: str) -> bool:
     return len(words) >= MIN_BOOK_TEXT_WORDS
 
 
+TOC_MARKER_RE = re.compile(r"^\s*(?:table of\s+)?contents\b", re.IGNORECASE)
+CHAPTER_LISTING_RE = re.compile(r"^\s*(chapter|book|part|section)\s+([ivxlcdm]+|\d+)\b", re.IGNORECASE)
+CONTENTS_MARKER_RE = re.compile(r"^\s*contents\.?\s*$", re.IGNORECASE)
+TOC_PAGE_HEADER_RE = re.compile(r"^\s*page\.?\s*$", re.IGNORECASE)
+TOC_ENTRY_RE = re.compile(
+    r"^\s*.+?\s{2,}\d{1,4}\s*$",
+    re.IGNORECASE,
+)
+ROMAN_VALUES = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+XML_DECL_RE = re.compile(r"<\?xml[^>]*\?>", re.IGNORECASE)
+CDATA_WRAPPER_RE = re.compile(r"<!\[CDATA\[|\]\]>", re.IGNORECASE)
+XML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->", re.IGNORECASE)
+SCRIPT_STYLE_BLOCK_RE = re.compile(r"<(script|style)\b[^>]*>[\s\S]*?</\1>", re.IGNORECASE)
+GENERIC_TAG_RE = re.compile(r"</?[a-z][^>]{0,200}>", re.IGNORECASE)
+CDATA_BLOCKOUT_LINE_RE = re.compile(
+    r"^\s*/\*\s*(?:<!\[CDATA\[\s*)?xml blockout[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+XML_STYLE_COMMENT_LINE_RE = re.compile(
+    r"^\s*/\*\s*xml\s+(?:start|end|blockout)[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+GUTENBERG_TRAILER_START_RE = re.compile(
+    r"^\s*section\s+1\.\s+general terms of use and redistributing project gutenberg",
+    re.IGNORECASE,
+)
+GUTENBERG_END_MARKER_RE = re.compile(
+    r"^\s*(\*\*\*\s*)?end of (?:(?:this|the)\s+)?project gutenberg",
+    re.IGNORECASE,
+)
+GUTENBERG_UPDATED_EDITIONS_RE = re.compile(
+    r"^\s*updated editions will replace the previous one",
+    re.IGNORECASE,
+)
+GUTENBERG_FILE_NAMED_RE = re.compile(
+    r"^\s*\*{3,}\s*this file should be named",
+    re.IGNORECASE,
+)
+GUTENBERG_TRADEMARK_SECTION_RE = re.compile(
+    r"^\s*project gutenberg(?:-tm)?\s+is\s+a\s+registered\s+trademark",
+    re.IGNORECASE,
+)
+GUTENBERG_START_MARKER_RE = re.compile(
+    r"^\s*\*{3,}\s*start of (?:(?:this|the)\s+)?project gutenberg",
+    re.IGNORECASE,
+)
+
+
+def _roman_to_int(value: str) -> int | None:
+    """Convert a roman numeral to int, returning None when malformed."""
+    token = value.strip().lower()
+    if not token or any(char not in ROMAN_VALUES for char in token):
+        return None
+
+    total = 0
+    prev = 0
+    for char in reversed(token):
+        current = ROMAN_VALUES[char]
+        if current < prev:
+            total -= current
+        else:
+            total += current
+            prev = current
+    return total if total > 0 else None
+
+
+def _heading_number(token: str) -> int | None:
+    token = token.strip()
+    if token.isdigit():
+        return int(token)
+    return _roman_to_int(token)
+
+
+def _strip_prefixed_toc_listing(text: str) -> str:
+    """
+    Remove a top-of-book table-of-contents listing when chapter numbering restarts.
+
+    This prevents TOC chapter lines from being interpreted as real chapter bodies,
+    which can shift chapter indices in the reader (e.g., chapter 22 opening chapter 1).
+    """
+    lines = text.splitlines()
+    if len(lines) < 80:
+        return text
+
+    max_scan = min(len(lines), 4000)
+    contents_idx = None
+    for idx, line in enumerate(lines[:max_scan]):
+        if TOC_MARKER_RE.match(line):
+            contents_idx = idx
+            break
+
+    if contents_idx is None:
+        return text
+
+    heading_rows: list[tuple[int, int]] = []
+    scan_end = min(len(lines), contents_idx + 2200)
+    for idx in range(contents_idx + 1, scan_end):
+        match = CHAPTER_LISTING_RE.match(lines[idx].strip())
+        if not match:
+            continue
+        number = _heading_number(match.group(2))
+        if number is None:
+            continue
+        heading_rows.append((idx, number))
+
+    if len(heading_rows) < 8:
+        return text
+
+    first_number = heading_rows[0][1]
+    for restart_pos in range(1, len(heading_rows)):
+        restart_line, restart_number = heading_rows[restart_pos]
+        if restart_number != first_number:
+            continue
+
+        toc_rows = heading_rows[:restart_pos]
+        if len(toc_rows) < 8:
+            continue
+
+        gaps = [toc_rows[i + 1][0] - toc_rows[i][0] for i in range(len(toc_rows) - 1)]
+        compact_ratio = (sum(gap <= 40 for gap in gaps) / len(gaps)) if gaps else 1.0
+        if compact_ratio < 0.7:
+            continue
+
+        follow_numbers = [num for _, num in heading_rows[restart_pos : restart_pos + 4]]
+        if len(follow_numbers) >= 2 and follow_numbers[1] != first_number + 1:
+            continue
+
+        cleaned_lines = lines[:contents_idx] + lines[restart_line:]
+        cleaned_text = "\n".join(cleaned_lines).strip()
+        return cleaned_text if cleaned_text else text
+
+    return text
+
+
+def _strip_contents_page_listing(text: str) -> str:
+    """
+    Remove front-matter contents pages that list topic titles with page numbers.
+
+    Example format:
+      CONTENTS.
+        Page
+        Obesity .... 1
+        Dwarfs .... 9
+    """
+    lines = text.splitlines()
+    if len(lines) < 20:
+        return text
+
+    max_marker_scan = min(len(lines), 3000)
+    marker_idx = None
+    for idx in range(max_marker_scan):
+        if CONTENTS_MARKER_RE.match(lines[idx].strip()):
+            marker_idx = idx
+            break
+    if marker_idx is None:
+        return text
+
+    max_scan = min(len(lines), marker_idx + 2600)
+    row_count = 0
+    end_idx = None
+
+    for idx in range(marker_idx + 1, max_scan):
+        stripped = lines[idx].strip()
+        if not stripped:
+            continue
+        if TOC_PAGE_HEADER_RE.match(stripped):
+            continue
+        if TOC_ENTRY_RE.match(stripped):
+            row_count += 1
+            continue
+
+        # Some long TOC entries wrap to a second line where only the wrapped
+        # fragment carries the trailing page number. If the next non-empty line
+        # is still a TOC row, keep scanning instead of ending the strip region.
+        next_nonblank = ""
+        for look_ahead in range(idx + 1, min(idx + 4, max_scan)):
+            candidate = lines[look_ahead].strip()
+            if candidate:
+                next_nonblank = candidate
+                break
+        if next_nonblank and TOC_ENTRY_RE.match(next_nonblank):
+            continue
+
+        # Stop when the listing ends and prose/content resumes.
+        end_idx = idx
+        break
+
+    if row_count < 8 or end_idx is None:
+        return text
+
+    cleaned_lines = lines[:marker_idx] + lines[end_idx:]
+    cleaned = "\n".join(cleaned_lines).strip()
+    return cleaned if cleaned else text
+
+
+def _strip_gutenberg_trailer(text: str) -> str:
+    """Drop trailing Project Gutenberg license/footer sections when present."""
+    lines = text.splitlines()
+    trailer_start = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if (
+            GUTENBERG_TRAILER_START_RE.match(stripped)
+            or GUTENBERG_END_MARKER_RE.match(stripped)
+            or GUTENBERG_UPDATED_EDITIONS_RE.match(stripped)
+            or GUTENBERG_FILE_NAMED_RE.match(stripped)
+            or GUTENBERG_TRADEMARK_SECTION_RE.match(stripped)
+        ):
+            trailer_start = idx
+            break
+    if trailer_start is None:
+        return text
+    trimmed = "\n".join(lines[:trailer_start]).strip()
+    return trimmed if trimmed else text
+
+
+def _strip_gutenberg_preamble(text: str) -> str:
+    """Drop leading Project Gutenberg header/license block when a START marker exists."""
+    lines = text.splitlines()
+    max_scan = min(len(lines), 800)
+    for idx in range(max_scan):
+        if GUTENBERG_START_MARKER_RE.match(lines[idx].strip()):
+            # Only strip when the marker appears near the front; this avoids
+            # cutting valid text if a quoted marker appears deep in the book.
+            if idx > 500:
+                return text
+            trimmed = "\n".join(lines[idx + 1 :]).lstrip()
+            return trimmed if trimmed else text
+    return text
+
+
+def _looks_like_html_markup(text: str) -> bool:
+    """Detect payloads that are plain-text labels but still contain HTML/XML markup."""
+    lower = text.lower()
+    if "<html" in lower or "<body" in lower or "<head" in lower or "<!doctype html" in lower:
+        return True
+    if "<![cdata[" in lower or "<?xml" in lower:
+        return True
+    tag_hits = len(re.findall(r"</?[a-z][^>]{0,120}>", lower))
+    return tag_hits >= 10
+
+
+def _strip_inline_markup_artifacts(text: str) -> str:
+    """Remove XML/HTML wrappers and styling blocks that leak into text payloads."""
+    if not text:
+        return text
+
+    clean_text = text
+    clean_text = XML_DECL_RE.sub(" ", clean_text)
+    clean_text = CDATA_WRAPPER_RE.sub(" ", clean_text)
+    clean_text = CDATA_BLOCKOUT_LINE_RE.sub(" ", clean_text)
+    clean_text = XML_STYLE_COMMENT_LINE_RE.sub(" ", clean_text)
+    clean_text = SCRIPT_STYLE_BLOCK_RE.sub(" ", clean_text)
+    clean_text = XML_COMMENT_RE.sub(" ", clean_text)
+    clean_text = _strip_unclosed_css_comment_block(clean_text)
+    clean_text = GENERIC_TAG_RE.sub(" ", clean_text)
+
+    # Remove any leftover blockout marker lines after comment/tag stripping.
+    clean_text = re.sub(r"^\s*xml blockout\s*$", " ", clean_text, flags=re.IGNORECASE | re.MULTILINE)
+    clean_text = re.sub(r"[ \t]+\n", "\n", clean_text)
+    clean_text = re.sub(r"\n{3,}", "\n\n", clean_text)
+    return clean_text.strip()
+
+
+def _strip_unclosed_css_comment_block(text: str) -> str:
+    """Drop leading CSS blocks introduced by a dangling '<!--' marker."""
+    marker = text.find("<!--")
+    if marker < 0 or marker > 2500:
+        return text
+
+    prefix = text[:marker]
+    suffix = text[marker + 4 :]
+    lines = suffix.splitlines()
+    if not lines:
+        return text
+
+    css_lines = 0
+    content_start = None
+    max_scan = min(len(lines), 1200)
+    for idx in range(max_scan):
+        stripped = lines[idx].strip()
+        if not stripped:
+            continue
+        is_css = (
+            "{" in stripped
+            or "}" in stripped
+            or ";" in stripped
+            or stripped.startswith((".", "#", "@"))
+            or re.match(r"^[a-z][a-z0-9_-]*\s*:\s*[^:]+;?$", stripped, re.IGNORECASE) is not None
+            or re.match(r"^[a-z0-9_.#,\s-]+\{$", stripped, re.IGNORECASE) is not None
+        )
+        if is_css:
+            css_lines += 1
+            continue
+        if css_lines >= 5:
+            content_start = idx
+            break
+        # If we hit non-CSS too early, this is probably not a style preamble.
+        return text
+
+    if content_start is None:
+        return text
+
+    remainder = "\n".join(lines[content_start:]).lstrip()
+    merged = (prefix.rstrip() + "\n\n" + remainder).strip()
+    return merged if merged else text
+
+
+def _normalize_clean_text(raw_text: str) -> str:
+    """Apply header stripping plus targeted TOC cleanup to imported text."""
+    preclean_raw_text = _strip_inline_markup_artifacts(raw_text)
+    raw_bytes = preclean_raw_text.encode("utf-8")
+    try:
+        clean_text = strip_headers(raw_bytes).decode("utf-8", errors="ignore")
+    except Exception:
+        clean_text = preclean_raw_text
+    clean_text = _strip_inline_markup_artifacts(clean_text)
+    clean_text = _strip_gutenberg_preamble(clean_text)
+    clean_text = _strip_contents_page_listing(clean_text)
+    clean_text = _strip_prefixed_toc_listing(clean_text)
+    clean_text = _strip_gutenberg_trailer(clean_text)
+    return clean_text
+
+
 def _chunked(values: list[int], size: int) -> list[list[int]]:
     """Split a list into fixed-size batches for SQL and cache lookups."""
     return [values[index : index + size] for index in range(0, len(values), size)]
 
 
-def _queue_key_for_run(*, repair_all: bool, gutenberg_ids: list[int] | None) -> str:
+def _queue_key_for_run(
+    *,
+    repair_all: bool,
+    repair_mismatched_content: bool,
+    gutenberg_ids: list[int] | None,
+) -> str:
     """Build the stable queue namespace for the current backfill mode."""
     # The queue key is the namespace for resumable state:
     # - one namespace for repair-all runs
+    # - one namespace for payload-id mismatch repair runs
     # - one namespace for the default missing-content run
     # - one namespace per explicit targeted id set
     # Seeding uses this key so reruns update the same rows instead of creating a new queue.
     if repair_all:
         return "repair-all:v2"
+    if repair_mismatched_content:
+        return "repair-mismatched:v1"
     if gutenberg_ids:
         normalized = ",".join(str(gid) for gid in sorted(set(gutenberg_ids)))
         digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
@@ -580,7 +920,7 @@ def _url_points_to_book_id(url: str, book_id: int) -> bool:
 def _fetch_live_file_index_links(book_id: int) -> list[tuple[str, str]]:
     """Scrape the live Gutenberg file index for content-bearing download links."""
     index_url = f"{GUTENBERG_FILES_URL}/{book_id}/"
-    response = urllib.request.urlopen(index_url)
+    response = urllib.request.urlopen(index_url, timeout=HTTP_TIMEOUT_SECONDS)
     try:
         payload = response.read().decode("utf-8", errors="ignore")
     finally:
@@ -613,10 +953,21 @@ class _TextExtractor(HTMLParser):
     def __init__(self):
         super().__init__()
         self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        """Skip script/style blocks in fallback mode."""
+        if tag and tag.lower() in {"script", "style"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag):
+        """Resume text capture after script/style blocks."""
+        if tag and tag.lower() in {"script", "style"} and self._skip_depth > 0:
+            self._skip_depth -= 1
 
     def handle_data(self, data):
         """Accumulate visible HTML text while discarding markup."""
-        if data:
+        if data and self._skip_depth == 0:
             self.parts.append(data)
 
     def get_text(self) -> str:
@@ -629,12 +980,22 @@ def _html_bytes_to_text(html_bytes: bytes) -> str:
     html_text = _decode_text_bytes(html_bytes)
     try:
         if lxml_html is not None:
-            return lxml_html.fromstring(html_text).text_content()
+            root = lxml_html.fromstring(html_text)
+            for node in root.xpath("//script|//style|//head"):
+                node.drop_tree()
+            body_nodes = root.xpath("//body")
+            target = body_nodes[0] if body_nodes else root
+            return target.text_content()
         parser = _TextExtractor()
         parser.feed(html_text)
         return parser.get_text()
     except Exception:
-        return html_text
+        try:
+            parser = _TextExtractor()
+            parser.feed(html_text)
+            return parser.get_text()
+        except Exception:
+            return html_text
 
 
 def _xml_bytes_to_text(xml_bytes: bytes) -> str:
@@ -680,14 +1041,17 @@ def _archive_bytes_to_text(archive_bytes: bytes) -> str:
 
 def _download_book_text(url: str, download_type: str) -> str:
     """Download a Gutenberg asset and normalize it to plain text."""
-    response = urllib.request.urlopen(url)
+    response = urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_SECONDS)
     try:
         payload = response.read()
     finally:
         response.close()
 
     if download_type.startswith("text/plain"):
-        return _decode_text_bytes(payload)
+        decoded_text = _decode_text_bytes(payload)
+        if _looks_like_html_markup(decoded_text):
+            return _html_bytes_to_text(payload)
+        return decoded_text
     if download_type.startswith("text/html"):
         return _html_bytes_to_text(payload)
     if download_type in {"application/prs.tei"}:
@@ -706,7 +1070,7 @@ def _download_book_text(url: str, download_type: str) -> str:
 @lru_cache(maxsize=1)
 def _get_mirrors() -> list[str]:
     """Fetch and cache the current list of Project Gutenberg mirrors."""
-    response = urllib.request.urlopen(MIRRORS_URL)
+    response = urllib.request.urlopen(MIRRORS_URL, timeout=HTTP_TIMEOUT_SECONDS)
     try:
         payload = response.read().decode("utf-8", errors="ignore")
     finally:
@@ -807,6 +1171,53 @@ def _get_all_books(db_path: str) -> list[tuple[int, int | None, str]]:
         rows = [(int(row[0]), int(row[1]) if row[1] is not None else None, row[2]) for row in cur.fetchall()]
         conn.close()
         return rows
+
+    return _with_sqlite_retry(query)
+
+
+def _get_mismatched_content_books(db_path: str) -> list[tuple[int, int | None, str]]:
+    """Return books whose stored payload marker conflicts with books.gutenbergbookid."""
+
+    def query():
+        conn = _connect_db(db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                b.id,
+                b.gutenbergbookid,
+                COALESCE((SELECT t.name FROM titles t WHERE t.bookid = b.id LIMIT 1), 'Untitled') AS title,
+                substr(bc.raw_content, 1, 30000)
+            FROM books b
+            JOIN book_contents bc ON bc.bookid = b.id
+            WHERE b.gutenbergbookid IS NOT NULL
+            ORDER BY b.numdownloads DESC
+            """
+        )
+        rows = cur.fetchall()
+        conn.close()
+
+        scanned = 0
+        marker_found = 0
+        mismatched: list[tuple[int, int | None, str]] = []
+        for row in rows:
+            scanned += 1
+            book_id = int(row[0])
+            gutenberg_id = int(row[1]) if row[1] is not None else None
+            title = row[2]
+            snippet = row[3] or ""
+            mismatch, detected = detect_gutenberg_id_mismatch(snippet, gutenberg_id)
+            if detected is not None:
+                marker_found += 1
+            if mismatch:
+                mismatched.append((book_id, gutenberg_id, title))
+
+        print(
+            "summary: "
+            f"mismatch_scan_total={scanned}, marker_found={marker_found}, mismatched={len(mismatched)}",
+            flush=True,
+        )
+        return mismatched
 
     return _with_sqlite_retry(query)
 
@@ -968,9 +1379,22 @@ def _get_all_download_candidates_for_books(
     return candidates_by_book
 
 
-def _save_book_content(db_path: str, book_id: int, raw_text: str, clean_text: str) -> None:
+def _save_book_content(
+    db_path: str,
+    book_id: int,
+    raw_text: str,
+    clean_text: str,
+    *,
+    expected_gutenberg_id: int | None = None,
+) -> None:
     """Write the canonical text payload for a book into book_contents."""
     def write():
+        mismatch, detected_id = detect_gutenberg_id_mismatch(raw_text, expected_gutenberg_id)
+        if mismatch:
+            raise ValueError(
+                f"payload Gutenberg ID mismatch for book_id={book_id}: "
+                f"expected={expected_gutenberg_id}, detected={detected_id}"
+            )
         conn = _connect_db(db_path)
         cur = conn.cursor()
         cur.execute("PRAGMA journal_mode = WAL")
@@ -1154,11 +1578,35 @@ def _process_backfill_queue_item(
         title,
         candidates,
         mirror_tries,
+        expected_gutenberg_id=gutenberg_id,
     )
 
     if result["status"] == "success":
         if not dry_run:
-            _save_book_content(db_path, book_id, result["raw_text"], result["clean_text"])
+            try:
+                _save_book_content(
+                    db_path,
+                    book_id,
+                    result["raw_text"],
+                    result["clean_text"],
+                    expected_gutenberg_id=gutenberg_id,
+                )
+            except Exception as exc:
+                _update_queue_status(
+                    db_path,
+                    queue_key,
+                    book_id,
+                    status="failed",
+                    attempt_delta=1,
+                    last_error=str(exc),
+                )
+                return {
+                    "status": "failed",
+                    "book_id": book_id,
+                    "source_book_id": result.get("source_book_id", source_book_id),
+                    "title": title,
+                    "error": exc,
+                }
             _update_queue_status(
                 db_path,
                 queue_key,
@@ -1209,6 +1657,8 @@ def _download_missing_book(
     title: str,
     candidates: list[tuple[str, str]],
     mirror_tries: int,
+    *,
+    expected_gutenberg_id: int | None = None,
     seen_source_ids: set[int] | None = None,
 ) -> dict:
     """Download, validate, and normalize one Gutenberg text candidate."""
@@ -1253,28 +1703,31 @@ def _download_missing_book(
                             f"Folio warning text; redirect disabled for {source_book_id}"
                         )
                         continue
-
-                    if not _looks_like_real_book_text(raw_text):
+                    mismatch, detected_id = detect_gutenberg_id_mismatch(raw_text, expected_gutenberg_id)
+                    if mismatch:
                         last_error = ValueError(
-                            f"Downloaded text from {source_book_id} looked like a stub, not book content"
+                            f"payload Gutenberg ID mismatch for book_id={target_book_id}: "
+                            f"expected={expected_gutenberg_id}, detected={detected_id}"
                         )
                         continue
 
-                    raw_bytes = raw_text.encode("utf-8")
-                    try:
-                        clean_text = strip_headers(raw_bytes).decode("utf-8", errors="ignore")
-                    except Exception:
-                        clean_text = raw_text
-                    return {
-                        "status": "success",
-                        "book_id": target_book_id,
-                        "source_book_id": source_book_id,
-                        "title": title,
-                        "source_type": download_type,
-                        "source_url": mirror_url,
-                        "raw_text": raw_text,
-                        "clean_text": clean_text,
-                    }
+                if not _looks_like_real_book_text(raw_text):
+                    last_error = ValueError(
+                        f"Downloaded text from {source_book_id} looked like a stub, not book content"
+                    )
+                    continue
+
+                clean_text = _normalize_clean_text(raw_text)
+                return {
+                    "status": "success",
+                    "book_id": target_book_id,
+                    "source_book_id": source_book_id,
+                    "title": title,
+                    "source_type": download_type,
+                    "source_url": mirror_url,
+                    "raw_text": raw_text,
+                    "clean_text": clean_text,
+                }
             except Exception as exc:
                 last_error = exc
 
@@ -1293,6 +1746,13 @@ def _download_missing_book(
                         f"Folio warning text; redirect disabled for {source_book_id}"
                     )
                     continue
+                mismatch, detected_id = detect_gutenberg_id_mismatch(raw_text, expected_gutenberg_id)
+                if mismatch:
+                    last_error = ValueError(
+                        f"payload Gutenberg ID mismatch for book_id={target_book_id}: "
+                        f"expected={expected_gutenberg_id}, detected={detected_id}"
+                    )
+                    continue
 
                 if not _looks_like_real_book_text(raw_text):
                     last_error = ValueError(
@@ -1300,11 +1760,7 @@ def _download_missing_book(
                     )
                     continue
 
-                raw_bytes = raw_text.encode("utf-8")
-                try:
-                    clean_text = strip_headers(raw_bytes).decode("utf-8", errors="ignore")
-                except Exception:
-                    clean_text = raw_text
+                clean_text = _normalize_clean_text(raw_text)
                 return {
                     "status": "success",
                     "book_id": target_book_id,
@@ -1334,6 +1790,7 @@ def backfill(
     gutenberg_ids: list[int] | None = None,
     force: bool = False,
     repair_all: bool = False,
+    repair_mismatched_content: bool = False,
     preflight: bool = False,
     preflight_only: bool = False,
     reset_queue: bool = False,
@@ -1362,6 +1819,8 @@ def backfill(
     print("stage: scanning catalog for books", flush=True)
     if repair_all:
         target_books = _get_all_books(db_path)
+    elif repair_mismatched_content:
+        target_books = _get_mismatched_content_books(db_path)
     elif gutenberg_ids:
         target_books = _get_target_books(db_path, gutenberg_ids)
     else:
@@ -1374,7 +1833,11 @@ def backfill(
         print("stage: loading Project Gutenberg mirrors", flush=True)
         mirrors = _get_mirrors()
 
-    queue_key = _queue_key_for_run(repair_all=repair_all, gutenberg_ids=gutenberg_ids)
+    queue_key = _queue_key_for_run(
+        repair_all=repair_all,
+        repair_mismatched_content=repair_mismatched_content,
+        gutenberg_ids=gutenberg_ids,
+    )
     # Seed rows under the namespace selected above, then reload the unfinished
     # rows from that same namespace so interrupted runs can resume.
     _queue_seed_books(db_path, queue_key, target_books, reset=reset_queue)
@@ -1480,6 +1943,7 @@ def main() -> None:
         gutenberg_ids=args.gutenberg_ids,
         force=args.force,
         repair_all=args.repair_all,
+        repair_mismatched_content=args.repair_mismatched_content,
         preflight=args.preflight,
         preflight_only=args.preflight_only,
         reset_queue=args.reset_queue,

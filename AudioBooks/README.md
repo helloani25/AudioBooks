@@ -17,7 +17,13 @@ A modular system for browsing and listening to Gutenberg project books.
    redis-server
    ```
 
-2. **Start the Backend**:
+2. **Set a random `SECRET_KEY`**:
+   Flask uses this key to sign session data and CSRF tokens. A predictable key allows cookie/token forgery, and changing the key invalidates existing sessions. Use a long random value per environment.
+   ```bash
+   export SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+   ```
+
+3. **Start the Backend**:
    Run from the project root:
    ```bash
    export PYTHONPATH=$PYTHONPATH:.
@@ -26,11 +32,11 @@ A modular system for browsing and listening to Gutenberg project books.
    *Note: Using `PYTHONPATH` ensures that absolute imports like `from AudioBooks...` are resolved correctly.*
 
 
-3. **Install npm**:
+4. **Install npm**:
 ```bash
 npm install
 ```
-4. **Start the Frontend**:
+5. **Start the Frontend**:
    ```bash
    cd AudioBooks/Presentation/library
    npm run dev
@@ -157,13 +163,15 @@ python AudioBooks/Catalog/Gutenberg/backfill_book_contents_hf_dataset.py --dry-r
 python AudioBooks/Catalog/Gutenberg/backfill_book_contents_hf_dataset.py --db-path AudioBooks/Catalog/DB/gutenbergindex.db
 ```
 
-Arguments:
-- `--print-columns`: show dataset features and available splits, then exit.
-- `--split <name>`: import one split only. Default is `en`.
-- `--all-splits`: import every split in the dataset dictionary.
-- `--dry-run`: match rows and count them without writing to SQLite.
-- `--limit <n>`: stop after `n` rows per split.
-- `--db-path <path>`: override the SQLite database location.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--print-columns` | off | Show dataset features and available splits, then exit |
+| `--split NAME` | `en` | Import one split only |
+| `--all-splits` | off | Import every split in the dataset dictionary |
+| `--force` | off | Overwrite existing `book_contents` rows |
+| `--dry-run` | off | Match rows and count them without writing to SQLite |
+| `--limit N` | — | Stop after N rows per split |
+| `--db-path PATH` | auto | Override the SQLite database path |
 
 The importer matches Hugging Face rows by `row["id"]` against `books.gutenbergbookid`, then stores the text in `book_contents.bookid`.
 
@@ -215,11 +223,28 @@ Queue namespaces:
 
 The namespace is derived from the run mode, and seeding updates rows inside that namespace instead of creating a new queue on each run. That is what lets the importer resume after an interruption.
 
-Useful flags:
-- `--repair-all`: scan every catalog book with a Gutenberg id
-- `--reset-queue`: clear the saved queue rows for the current namespace before starting
-- `--refresh-discovery-cache`: ignore cached live-index/candidate data and rebuild it
-- `--max-attempts`: stop retrying a book after repeated failures
+#### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--gutenberg-id N` | — | Target a specific Gutenberg id (repeatable) |
+| `--force` | off | Overwrite existing `book_contents` rows for targeted ids |
+| `--repair-all` | off | Scan every catalog book with a Gutenberg id and rewrite from live source |
+| `--repair-mismatched-content` | off | Rewrite books whose stored payload advertises a different Gutenberg id |
+| `--preflight` | off | Classify books as repair/refresh/skip/audio-only before downloading |
+| `--preflight-only` | off | Print the classification plan and exit without downloading |
+| `--dry-run` | off | Download and validate text in memory without writing to SQLite |
+| `--reset-queue` | off | Discard saved queue state for the current namespace before starting |
+| `--refresh-discovery-cache` | off | Rebuild live-index and candidate discovery instead of reusing cached data |
+| `--workers N` | 8 | Number of concurrent download workers |
+| `--max-attempts N` | 3 | Stop retrying a book after N consecutive failures |
+| `--mirror-tries N` | 3 | Mirror hosts to try per book before falling back to the source URL |
+| `--chunk-size N` | 500 | Books kept in flight per batch when resolving candidates and downloading |
+| `--limit N` | — | Stop after processing N books |
+| `--ca-bundle PATH` | — | Path to a PEM CA bundle file |
+| `--ca-dir PATH` | — | Path to a directory of CA certificates |
+| `--no-verify` | off | Disable SSL certificate verification |
+| `--db-path PATH` | auto | Override the SQLite database path |
 
 Run combinations:
 - `python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py`: default missing-content run; classifies each book as skip or download and uses cached local candidates first.
@@ -231,11 +256,6 @@ Run combinations:
 - `python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py --repair-all --reset-queue`: rerun the full sweep from scratch for the `repair-all:v2` namespace.
 - `python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py --repair-all --refresh-discovery-cache`: force live-index and candidate discovery to be rebuilt instead of reused.
 - `python AudioBooks/Catalog/Gutenberg/backfill_missing_book_contents.py --dry-run`: download and validate text in memory, but do not write to SQLite.
-
-Tuning notes:
-- `--chunk-size`: bigger chunks reduce SQL round trips and executor churn, but use more memory per batch.
-- `--workers`: higher values increase parallel downloads, but returns diminish once network or Gutenberg starts throttling.
-- `--mirror-tries`: more retries improve resilience on flaky mirrors, but each extra try adds network time per book.
 
 The queue is seeded on every run, but existing rows are updated instead of duplicated. Completed rows stay completed across reruns until you reset the queue.
 
@@ -324,6 +344,12 @@ python AudioBooks/Catalog/Gutenberg/repair_short_chapter_books.py --book-id 2202
 
 # Delete the first 50 matches and print every scanned row
 python AudioBooks/Catalog/Gutenberg/repair_short_chapter_books.py --limit 50 --verbose
+
+# Parallel scan with worker processes and batched commits
+python AudioBooks/Catalog/Gutenberg/repair_short_chapter_books.py --workers 8 --worker-chunk-size 16 --commit-every 200
+
+# Fast bounded dry-run while tuning performance
+python AudioBooks/Catalog/Gutenberg/repair_short_chapter_books.py --dry-run --workers 8 --scan-limit 200 --db-fetch-size 200
 ```
 
 #### Flags
@@ -333,15 +359,21 @@ python AudioBooks/Catalog/Gutenberg/repair_short_chapter_books.py --limit 50 --v
 | `--book-id N` | — | Scan only the given internal `books.id` (repeatable) |
 | `--min-lines N` | 10 | Minimum non-empty lines required for interior chapters |
 | `--limit N` | — | Stop after deleting N books |
+| `--scan-limit N` | — | Stop after scanning N candidate books (dry-run friendly) |
+| `--workers N` | 1 | Parallel workers for chapter scanning |
+| `--worker-chunk-size N` | 8 | Chunk size for worker map batches |
+| `--commit-every N` | 100 | Commit deletes every N matched books |
+| `--db-fetch-size N` | 500 | SQLite rows fetched per batch before worker dispatch |
 | `--verbose` | off | Print per-book scan output |
 | `--dry-run` | off | Preview deletions without writing |
 | `--db-path PATH` | auto | Override the SQLite database path |
 
 The script uses the same chapter heading detection as the chapter-splitting test harness, so it only deletes books that actually split into 3 or more chapter blocks and have all middle chapters below the line threshold.
+If process workers are unavailable in the runtime, the script automatically falls back to thread workers when `--workers > 1`.
 
 ### Sensitive-topic cleanup
 
-Use `AudioBooks/Catalog/Gutenberg/repair_sensitive_topic_books.py` to remove catalog entries that match explicit topic filters for erotic, gory violence, psychic, Mahabharata, intent to glorify violence or occult worship, or Bible-attack / anti-Bible content. The script checks the book title, subjects, and description for the general topic rules, and also scans the text for the Bible-related and intent-based violence/occult rules, then deletes only when one of the filters matches.
+Use `AudioBooks/Catalog/Gutenberg/repair_sensitive_topic_books.py` to remove catalog entries that match explicit topic filters for erotic, gory violence, psychic, intent to glorify violence or occult worship, or Bible-attack / anti-Bible content. The script checks the book title, subjects, and description for the general topic rules, and also scans the text for the Bible-related and intent-based violence/occult rules, then deletes only when one of the filters matches.
 
 The violence rule is intentionally narrow: it is meant for text that reads like explicit gore, torture, mutilation, dismemberment, or `Saw`-style graphic content. A classic tragedy such as `Macbeth` should not match just because it contains murder or violent themes.
 
@@ -425,14 +457,14 @@ After running, restart Flask to clear in-process caches.
 
 #### Flags
 
-| Flag | Description |
-|------|-------------|
-| `--find-duplicates` | Detect and list duplicate groups without merging |
-| `--auto-merge` | Detect and merge all duplicate groups automatically |
-| `--source N` | Internal `books.id` to merge from (will be deleted) |
-| `--target N` | Internal `books.id` to merge into (canonical, kept) |
-| `--dry-run` | Preview changes without writing to SQLite |
-| `--limit N` | Max duplicate groups to process (--auto-merge only) |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--find-duplicates` | off | Detect and list duplicate groups without merging |
+| `--auto-merge` | off | Detect and merge all duplicate groups automatically |
+| `--source N` | — | Internal `books.id` to merge from (will be deleted) |
+| `--target N` | — | Internal `books.id` to merge into (canonical, kept) |
+| `--dry-run` | off | Preview changes without writing to SQLite |
+| `--limit N` | — | Max duplicate groups to process (`--auto-merge` only) |
 
 ### Audio catalog backfill
 
@@ -539,15 +571,16 @@ python AudioBooks/Catalog/Gutenberg/backfill_cover_art.py --refresh-live
 python AudioBooks/Catalog/Gutenberg/backfill_cover_art.py --gutenberg-id 1342
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--dry-run` | Preview without writing |
-| `--refresh-live` | Fetch the live Gutenberg RDF even when a local cache exists |
-| `--no-verify` | Disable SSL certificate verification |
-| `--gutenberg-id N` | Process only the specified id (repeatable) |
-| `--limit N` | Stop after N books |
-| `--ca-bundle PATH` | Path to a PEM CA bundle |
-| `--ca-dir PATH` | Path to a directory of CA certificates |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--gutenberg-id N` | — | Process only the specified Gutenberg id (repeatable) |
+| `--refresh-live` | off | Fetch the live Gutenberg RDF even when a local cache exists |
+| `--dry-run` | off | Preview without writing |
+| `--no-verify` | off | Disable SSL certificate verification |
+| `--limit N` | — | Stop after N books |
+| `--ca-bundle PATH` | — | Path to a PEM CA bundle file |
+| `--ca-dir PATH` | — | Path to a directory of CA certificates |
+| `--db-path PATH` | auto | Override the SQLite database path |
 
 ### Book summaries backfill
 
@@ -571,3 +604,507 @@ The importer downloads `booksummaries.tar.gz` from the CMU dataset page by defau
 - `summary`
 
 Rows are matched to existing catalog books by normalized title and author, then written to `book_desc.bookid`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dry-run` | off | Preview matches without writing |
+| `--limit N` | — | Stop after N summary rows |
+| `--tarball-path PATH` | auto | Use a local `booksummaries.tar.gz` instead of downloading |
+| `--source-url URL` | CMU URL | Override the download URL |
+| `--commit-every N` | 500 | Commit after N inserted rows |
+| `--progress-every N` | 250 | Print progress after N rows |
+| `--unmatched-limit N` | 20 | Number of unmatched rows to show in the summary |
+
+Run CMU first (broad coverage), then follow up with the Gutenberg backfill below for gaps.
+
+### Gutenberg HTML + images backfill
+
+Use `AudioBooks/Catalog/Gutenberg/backfill_book_html.py` to download the illustrated HTML edition of each book (the `-h.zip` archive), upload its images to Google Cloud Storage, rewrite image paths so they route through the Flask image endpoint, and store the resulting HTML in `book_contents` with `content_type='html'`.
+
+#### Why this exists
+
+Project Gutenberg publishes an illustrated HTML edition (`-h.zip`) for most books. These editions contain inline images that are **absent from the plain-text file** — the only way to read these books as originally published is to render the HTML edition with its illustrations intact.
+
+#### Source of the illustrations
+
+The images are the original illustrations from each book's first publication, digitised by Project Gutenberg volunteers and released into the public domain along with the text. They include:
+
+- **Engravings and woodcuts** from 19th-century novels and poetry collections
+- **Photographs** from travel memoirs, natural history books, and biographies
+- **Maps and diagrams** from geography, science, and history titles
+- **Decorative frontispieces and chapter headings** from classic literature
+
+Gutenberg's deep-linking policy forbids serving URLs that point directly to `gutenberg.org/files/...`, so we must self-host copies of those images. The cleaned HTML is stored in SQLite; the images are stored in Google Cloud Storage (`gs://gutenberg-books`).
+
+#### Scale and storage requirements
+
+| Metric | Value |
+|--------|-------|
+| Books with a `-h.zip` entry in `downloadlinks` | **75,764** |
+| Total `downloadlinks` rows with type 8 | **925,761** (multiple per book across mirrors) |
+| Average `-h.zip` size | ~500 KB – 2 MB |
+| Average images per illustrated book | 10 – 20 files |
+| **Estimated total image storage** | **20 – 50 GB** |
+| HTML text per book (stored in SQLite) | ~100 – 800 KB |
+
+This is why images go to GCS rather than SQLite:
+- 50 GB of binary blobs would make `gutenbergindex.db` unmanageable and slow
+- GCS provides CDN-friendly delivery and signed URL access control without loading the Flask process with binary data
+- SQLite is kept for structured metadata and the text/HTML content itself
+
+#### Why GCS signed URLs
+
+Images are served via `GET /api/books/<book_id>/images/<filename>`, which generates a short-lived GCS signed URL (1-hour TTL) and returns a 302 redirect. This approach:
+- Satisfies Gutenberg's deep-linking requirement (we serve from our own domain)
+- Keeps image bytes out of the Flask process (browser fetches directly from GCS after redirect)
+- Allows access control to be changed later without rebuilding the HTML
+
+Signed URLs require a **service account key** (JSON file). Provide it via `--gcs-credentials` or the `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
+
+#### What gets stored
+
+| Table | Column | Value |
+|-------|--------|-------|
+| `book_contents` | `content_type` | `'html'` |
+| `book_contents` | `raw_content` | Original HTML from the zip (Gutenberg output, unmodified) |
+| `book_contents` | `clean_content` | Same HTML with all image `src`/`href` paths rewritten to `/api/books/{id}/images/{filename}` |
+| GCS | `book-html/{gutenberg_id}/images/{filename}` | Image files extracted from the zip |
+
+#### DB migration
+
+The `content_type` column did not exist in the original `book_contents` schema. The script runs `ALTER TABLE book_contents ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'` automatically on first run. Existing plain-text rows get `content_type = 'text'` with no data loss.
+
+```bash
+# Dry-run for one book (check what would be downloaded)
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --dry-run --gutenberg-ids 43477
+
+# Single book with explicit service account credentials
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html \
+  --gutenberg-ids 43477 \
+  --gcs-credentials /path/to/service-account.json
+
+# Full run with 8 parallel workers
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --workers 8
+
+# Resume an interrupted run (already-done books are skipped automatically)
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --workers 4
+
+# Re-process books that already have HTML content
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --force --reset-queue
+
+# Check queue state from a previous run without processing anything
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --status
+
+# Works around macOS SSL cert issues
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --no-verify
+```
+
+#### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db PATH` | auto | Override the SQLite database path |
+| `--gcs-bucket NAME` | `gutenberg-books` | GCS bucket name |
+| `--gcs-credentials PATH` | env | Path to service account JSON key. Defaults to `GOOGLE_APPLICATION_CREDENTIALS` |
+| `--book-ids IDS` | — | Comma-separated internal `books.id` values to process |
+| `--gutenberg-ids IDS` | — | Comma-separated Gutenberg IDs to process |
+| `--force` | off | Re-process books that already have HTML content in `book_contents` |
+| `--dry-run` | off | Discover and log without downloading or writing anything |
+| `--reset-queue` | off | Delete all queue rows for this namespace before running |
+| `--status` | off | Print per-status queue counts and exit without processing |
+| `--no-verify` | off | Disable SSL certificate verification (workaround for macOS cert issues) |
+| `--ca-bundle PATH` | — | Path to a PEM CA bundle file |
+| `--ca-dir PATH` | — | Path to a directory of CA certificates |
+| `--workers N` | 4 | Parallel download workers |
+| `--chunk-size N` | 100 | Queue chunk size per executor batch |
+| `--max-attempts N` | 3 | Skip books with this many consecutive failures |
+| `--limit N` | — | Stop after discovering N books (useful for test runs) |
+| `--progress-every N` | 50 | Print progress every N books |
+
+#### Practical run combinations
+
+**Step 1 — check prior state before any run**
+```bash
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --status
+```
+
+**Step 2 — dry-run a small batch to verify GCS connectivity and scope**
+```bash
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --dry-run --limit 50
+```
+
+**Step 3 — smoke-test end-to-end with 10 books**
+```bash
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --limit 10 --workers 2 --progress-every 5
+```
+
+**Step 4 — full production run (credentials and bucket loaded from `.env`)**
+```bash
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html \
+  --workers 8 --chunk-size 200 --max-attempts 3 --progress-every 50
+```
+
+**Resume after interruption** (queue remembers state; failed rows are retried up to `--max-attempts`)
+```bash
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --workers 8 --max-attempts 5
+```
+
+**Process specific books by internal ID** (e.g. after a targeted repair)
+```bash
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --book-ids 48907,12345 --force
+```
+
+**Force full re-run from scratch** (clears queue and reprocesses all books)
+```bash
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html \
+  --force --reset-queue --workers 8 --chunk-size 200
+```
+
+**Retry skipped books** — books with `status='skipped'` (no image-capable download found on the first pass) are excluded from normal runs.  Reset them to `pending` then re-run:
+```bash
+sqlite3 AudioBooks/Catalog/DB/gutenbergindex.db \
+  "UPDATE book_content_backfill_queue SET status='pending', attempts=0 WHERE queue_key='html:v1' AND status='skipped';"
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --workers 8
+```
+
+**macOS SSL fix** — use `--no-verify` when urllib raises certificate verification errors
+```bash
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --no-verify --workers 4
+```
+
+**Explicit credentials / bucket override** (overrides `.env` values)
+```bash
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html \
+  --gcs-bucket my-bucket --gcs-credentials /path/to/key.json --workers 8
+```
+
+| Command | Effect |
+|---------|--------|
+| `--status` | Print per-status queue counts from last run and exit |
+| `--dry-run --limit 50` | Discover scope and verify GCS connectivity; no writes |
+| `--limit 10 --workers 2` | Smoke-test end-to-end on 10 books |
+| `--workers 8 --chunk-size 200` | Full production run; resumes from last checkpoint |
+| `--workers 8 --max-attempts 5` | Resume an interrupted run with more retries |
+| `--book-ids 48907,12345 --force` | Reprocess specific books by internal ID |
+| `--force --reset-queue --workers 8` | Full re-run from scratch; overwrites existing HTML |
+| `--no-verify --workers 4` | SSL verification disabled (macOS cert fix) |
+| `--gcs-bucket NAME --gcs-credentials PATH` | Override `.env` bucket/credentials explicitly |
+
+#### Count image-backed books in GCS
+
+Use `AudioBooks/Catalog/Gutenberg/count_gcs_image_books.py` to count how many Gutenberg IDs currently have uploaded image objects in GCS (`book-html/<gid>/images/...`) and map those IDs back to internal `books.id` rows in SQLite.
+
+```bash
+# Uses GCS_BUCKET and GOOGLE_APPLICATION_CREDENTIALS from .env
+python -m AudioBooks.Catalog.Gutenberg.count_gcs_image_books
+
+# Explicit bucket/credentials override
+python -m AudioBooks.Catalog.Gutenberg.count_gcs_image_books \
+  --bucket gutenberg-books \
+  --gcs-credentials /path/to/service-account.json
+
+# Also print Gutenberg IDs that map to multiple internal book IDs
+python -m AudioBooks.Catalog.Gutenberg.count_gcs_image_books \
+  --show-duplicate-mappings --duplicate-limit 20
+```
+
+Output fields:
+
+- `gcs_gutenberg_ids_with_images`: distinct Gutenberg IDs found under `book-html/<gid>/images/`
+- `db_internal_book_ids_mapped`: distinct internal `books.id` rows mapped from those Gutenberg IDs
+- `db_gutenberg_ids_matched`: distinct mapped Gutenberg IDs in SQLite
+- `gids_without_db_match`: GCS Gutenberg IDs that were not found in SQLite
+- `gutenberg_ids_with_multiple_internal_books`: Gutenberg IDs mapped to more than one internal book row
+
+#### Queue table
+
+Run state is stored in `book_content_backfill_queue` under namespace `html:v1`. Every startup prints the prior queue counts so you can see how much work remains from an interrupted run.
+
+| Column | Description |
+|--------|-------------|
+| `status` | `pending` → `done` / `skipped` / `failed` (failed rows are retried on the next run up to `--max-attempts`) |
+| `source_url` | The `-h.zip` URL that was (or will be) downloaded |
+| `source_type` | Always `h-zip` |
+| `attempts` | Incremented on each failure |
+| `last_error` | Last exception message for failed books |
+
+The queue is seeded on every run. Already-done and skipped rows are preserved across runs; only `pending` and `failed` rows are picked up for processing.
+
+---
+
+### Gutenberg book description backfill
+
+Use `AudioBooks/Catalog/Gutenberg/backfill_book_desc_gutenberg.py` to fill gaps in `book_desc` using Gutenberg RDF metadata and ebook page summaries. Run this **after** `backfill_book_desc.py` to supplement books the CMU dataset did not cover.
+
+The script is resumable — each run is tracked in a `book_desc_backfill_queue` SQLite table. Stopping and restarting automatically continues from where it left off.
+
+```bash
+# Preview what would be updated
+python AudioBooks/Catalog/Gutenberg/backfill_book_desc_gutenberg.py --dry-run
+
+# Normal run — only processes books missing a summary or wikipedia_id
+python AudioBooks/Catalog/Gutenberg/backfill_book_desc_gutenberg.py
+
+# Parallel run with 8 workers (faster for Wikipedia API / live fetches)
+python AudioBooks/Catalog/Gutenberg/backfill_book_desc_gutenberg.py --workers 8
+
+# Fetch live RDF and ebook page summaries for books not in the local cache
+python AudioBooks/Catalog/Gutenberg/backfill_book_desc_gutenberg.py --refresh-live --workers 8
+
+# Overwrite existing summaries with Gutenberg-derived ones
+python AudioBooks/Catalog/Gutenberg/backfill_book_desc_gutenberg.py --force-summary
+
+# Target a specific book
+python AudioBooks/Catalog/Gutenberg/backfill_book_desc_gutenberg.py --gutenberg-id 1342
+python AudioBooks/Catalog/Gutenberg/backfill_book_desc_gutenberg.py --book-id 22025
+
+# Restart from scratch (clear queue rows for the current namespace)
+python AudioBooks/Catalog/Gutenberg/backfill_book_desc_gutenberg.py --reset-queue
+
+# Verbose output showing per-book step traces
+python AudioBooks/Catalog/Gutenberg/backfill_book_desc_gutenberg.py --verbose --limit 50
+```
+
+The script resolves summaries in priority order per book:
+
+1. **Sibling summary** — another `book_desc` row for the same normalized title + author.
+2. **RDF `marc520` field** — from the local RDF cache at `Catalog/DB/cache/epub/<id>/pg<id>.rdf`.
+3. **Ebook HTML page** — parses the `summary-text-container` node from `gutenberg.org/ebooks/<id>` (only when `--refresh-live` is passed).
+
+Wikipedia URLs found in RDF `dcterms:description` text and `pgterms:webpage` links are resolved to Wikipedia page IDs via the Wikipedia API and stored in `book_desc.wikipedia_id`.
+
+By default only books with a missing summary **or** missing `wikipedia_id` are loaded — already-complete rows are skipped at the SQL level.
+
+#### Resumable queue
+
+Run state is stored in `book_desc_backfill_queue` (one row per book per namespace):
+
+| Column | Description |
+|--------|-------------|
+| `status` | `pending` → `done` / `skipped` / `failed` |
+| `attempts` | Incremented on each failure; capped by `--max-attempts` |
+| `last_error` | Last exception message for failed books |
+| `summary_source` | Which source filled the summary (`gutenberg-rdf`, `book-desc-sibling`, etc.) |
+
+Namespaces are auto-derived from the run mode — no flag needed:
+
+| Run mode | Namespace |
+|----------|-----------|
+| Default (missing only) | `missing:v1` |
+| `--force-summary` or `--force-wikipedia-id` | `force:v1` |
+| Specific `--book-id` / `--gutenberg-id` | `targeted:v1:<hash>` |
+
+#### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dry-run` | off | Preview updates without writing |
+| `--verbose` | off | Print per-book step traces (`step=sibling`, `step=rdf`, `step=html-fetch`, `step=wikipedia-resolve`) |
+| `--limit N` | — | Stop after N target books |
+| `--book-id N` | — | Process only the given internal `books.id` (repeatable) |
+| `--gutenberg-id N` | — | Process only books with this `gutenbergbookid` (repeatable) |
+| `--force-summary` | off | Overwrite existing non-empty summaries |
+| `--force-wikipedia-id` | off | Overwrite existing `wikipedia_id` values |
+| `--refresh-live` | off | Fetch live RDF/page content and ebook HTML when local cache is missing |
+| `--workers N` | 4 | Parallel threads for I/O-bound work (Wikipedia API, RDF reads, HTML fetches) |
+| `--chunk-size N` | 64 | Books submitted to the thread pool per batch |
+| `--max-attempts N` | 3 | Stop retrying a book after N consecutive failures |
+| `--reset-queue` | off | Clear saved queue rows for the current namespace and start fresh |
+| `--commit-every N` | 200 | Commit writes every N updated rows |
+| `--progress-every N` | 100 | Print progress after N processed books |
+| `--db-path PATH` | auto | Override the SQLite database path |
+
+#### Practical run combinations
+
+| Command | Effect |
+|---------|--------|
+| `backfill_book_desc_gutenberg.py` | Fill missing summaries/wikipedia_ids from local RDF cache; resumable |
+| `backfill_book_desc_gutenberg.py --workers 8` | Same with 8 parallel workers |
+| `backfill_book_desc_gutenberg.py --refresh-live --workers 8` | Also fetch live RDF and ebook HTML pages |
+| `backfill_book_desc_gutenberg.py --reset-queue` | Restart the run from scratch |
+| `backfill_book_desc_gutenberg.py --force-summary --refresh-live` | Overwrite all summaries using live Gutenberg sources |
+| `backfill_book_desc_gutenberg.py --gutenberg-id 1342 --verbose` | Debug a single book with full step traces |
+
+---
+
+## GCS Upload Pipeline
+
+After backfilling `book_contents` and `book_desc` in SQLite, these two scripts upload the data to Google Cloud Storage so the remote summarization harness (`test_summaries_blackwell.py`) can run without a local SQLite connection.
+
+**Run order:** `book_contents_upload.py` first, then `book_desc_upload.py`.
+
+### Environment setup
+
+Both scripts read credentials and bucket name from `.env`:
+
+```
+GCS_BUCKET=your-bucket-name
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+```
+
+### GCS layout
+
+| Path | Content |
+|------|---------|
+| `gs://<bucket>/book-contents/<bookid>/clean_content.txt` | Plain-text clean content |
+| `gs://<bucket>/book-contents/<bookid>/clean_content.html` | HTML clean content (when `content_type='html'`) |
+| `gs://<bucket>/book-desc/<bookid>.json` | Per-book title, author, and summary |
+| `gs://<bucket>/book-desc/gutenberg-id-map.json` | `{str(gutenberg_id): book_id}` lookup used by the summarizer |
+
+### `book_contents_upload.py`
+
+Uploads `clean_content` from `book_contents` to GCS. Run state is persisted in `book_contents_upload_queue` so interrupted runs resume automatically.
+
+```bash
+# Check prior run state
+python AudioBooks/BookSummary/book_contents_upload.py --status
+
+# Dry-run to preview scope
+python AudioBooks/BookSummary/book_contents_upload.py --dry-run --limit 20
+
+# Smoke-test: upload 10 books with 2 workers
+python AudioBooks/BookSummary/book_contents_upload.py --limit 10 --workers 2
+
+# Full upload
+python AudioBooks/BookSummary/book_contents_upload.py --workers 8 --chunk-size 200
+
+# Resume an interrupted run (failed rows retried up to --max-attempts)
+python AudioBooks/BookSummary/book_contents_upload.py --workers 8 --max-attempts 5
+
+# Re-upload specific books
+python AudioBooks/BookSummary/book_contents_upload.py --book-ids 48907,12345 --force
+
+# Full re-run from scratch
+python AudioBooks/BookSummary/book_contents_upload.py --reset-queue --workers 8
+```
+
+`--reset-queue` already clears all `done` rows for this uploader, so running `--force` in the same command does not change scope.
+
+#### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db PATH` | auto | Override the SQLite database path |
+| `--bucket NAME` | `GCS_BUCKET` from `.env` | GCS bucket name |
+| `--book-ids IDS` | — | Comma-separated internal `books.id` values |
+| `--limit N` | — | Stop after discovering N books |
+| `--force` | off | Re-upload books already marked done in the queue |
+| `--dry-run` | off | Preview without uploading or writing queue rows |
+| `--reset-queue` | off | Delete all queue rows before running (this already causes a full rerun, so `--force` is not needed in the same run) |
+| `--status` | off | Print queue state and exit |
+| `--workers N` | 4 | Parallel upload workers |
+| `--chunk-size N` | 100 | Books per executor batch |
+| `--max-attempts N` | 3 | Skip books with this many consecutive failures |
+| `--progress-every N` | 50 | Print progress every N books |
+
+### `book_desc_upload.py`
+
+Uploads `book_desc` rows as per-book JSON blobs and writes the `gutenberg-id-map.json` index to GCS. The id map is what `test_summaries_blackwell.py` uses to resolve a Gutenberg id to an internal `book_id`. Run state is persisted in `book_desc_upload_queue`.
+
+```bash
+# Check prior run state
+python AudioBooks/BookSummary/book_desc_upload.py --status
+
+# Dry-run to preview scope
+python AudioBooks/BookSummary/book_desc_upload.py --dry-run --limit 20
+
+# Full upload
+python AudioBooks/BookSummary/book_desc_upload.py --workers 8 --chunk-size 200
+
+# Resume after interruption
+python AudioBooks/BookSummary/book_desc_upload.py --workers 8 --max-attempts 5
+
+# Force re-upload specific books
+python AudioBooks/BookSummary/book_desc_upload.py --book-ids 48907,12345 --force
+
+# Full re-run from scratch
+python AudioBooks/BookSummary/book_desc_upload.py --reset-queue --workers 8
+```
+
+#### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db PATH` | auto | Override the SQLite database path |
+| `--bucket NAME` | `GCS_BUCKET` from `.env` | GCS bucket name |
+| `--book-ids IDS` | — | Comma-separated internal `books.id` values |
+| `--limit N` | — | Stop after discovering N books |
+| `--force` | off | Re-upload books already marked done in the queue |
+| `--dry-run` | off | Preview without uploading or writing queue rows |
+| `--reset-queue` | off | Delete all queue rows before running (this already causes a full rerun, so `--force` is not needed in the same run) |
+| `--status` | off | Print queue state and exit |
+| `--workers N` | 4 | Parallel upload workers |
+| `--chunk-size N` | 100 | Books per executor batch |
+| `--max-attempts N` | 3 | Skip books with this many consecutive failures |
+| `--progress-every N` | 50 | Print progress every N books |
+
+The `gutenberg-id-map.json` is always (re)uploaded at the end of every successful run, even partial ones, so it stays consistent with the book-desc blobs that were written.
+
+## GCP Spot VM Inference with Terraform
+
+Provision a low-cost GCP Spot VM to run large language models (like Gemma) using Terraform.
+
+### How to Run
+
+1. **Authenticate and Set Project**:
+   ```bash
+   gcloud auth application-default login
+   gcloud auth application-default set-quota-project gen-lang-client-0910392250
+   # or
+   gcloud config set project gen-lang-client-0910392250
+   ```
+
+2. **Initialize Terraform**:
+   ```bash
+   cd AudioBooks/Terraform
+   terraform init
+   ```
+
+3. **Deploy (Setup)**:
+   Provision the spot instance.
+   ```bash
+   terraform apply -var="hf_token=your_hf_token_here" -auto-approve
+   ```
+
+4. **Connect to VM**:
+   ```bash
+   gcloud compute ssh gemma-cpu-spot-tf --zone=us-central1-a
+   ```
+
+5. **Run Inference**:
+   Once inside the VM, create a file named `inference.py`:
+   ```python
+   import torch
+   from transformers import AutoTokenizer, AutoModelForCausalLM
+
+   model_id = "google/gemma-2-9b-it" # or "google/gemma-2-27b-it"
+
+   print("Loading model to CPU...")
+   tokenizer = AutoTokenizer.from_pretrained(model_id)
+   model = AutoModelForCausalLM.from_pretrained(model_id, device_map="cpu", torch_dtype=torch.bfloat16)
+
+   input_text = "What are the advantages of running Gemma on a Spot VM?"
+   inputs = tokenizer(input_text, return_tensors="pt").to("cpu")
+
+   print("Running inference...")
+   outputs = model.generate(**inputs, max_new_tokens=50)
+   print(tokenizer.decode(outputs[0]))
+   ```
+   Execute it:
+   ```bash
+   python3 inference.py
+   ```
+
+6. **Teardown**:
+   Destroy the instance when finished to stop all active billing.
+   ```bash
+   terraform destroy -var="hf_token=your_hf_token_here" -auto-approve
+   ```
+
+#### TODO:
+Run backfill script to fix the missing images from the books that were skipped.
+```commandline 
+sqlite3 AudioBooks/Catalog/DB/gutenbergindex.db \
+  "UPDATE book_content_backfill_queue SET status='pending', attempts=0 WHERE queue_key='html:v1' AND status='skipped';"
+python -m AudioBooks.Catalog.Gutenberg.backfill_book_html --workers 8
+```

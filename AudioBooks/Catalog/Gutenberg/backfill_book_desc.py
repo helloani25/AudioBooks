@@ -200,7 +200,7 @@ def _load_catalog_index(conn: sqlite3.Connection):
     token_index: dict[str, set[int]] = defaultdict(set)
     all_books: dict[int, dict] = {}
 
-    for book_id, gutenberg_id, dateissued, title, authors in cur.fetchall():
+    for book_id, gutenberg_id, dateissued, title, authors in cur:
         record = {
             "bookid": int(book_id),
             "gutenbergbookid": int(gutenberg_id) if gutenberg_id is not None else None,
@@ -226,7 +226,7 @@ def _load_catalog_index(conn: sqlite3.Connection):
 def _load_existing_book_desc_ids(conn: sqlite3.Connection) -> set[int]:
     cur = conn.cursor()
     cur.execute("SELECT bookid FROM book_desc")
-    return {int(row[0]) for row in cur.fetchall()}
+    return {int(row[0]) for row in cur}
 
 
 def _split_author_names(value: str | None) -> list[str]:

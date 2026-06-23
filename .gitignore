@@ -10,3 +10,5 @@ __pycache__/
 /AudioBooks/Catalog/DB/
 /AudioBooks/Presentation/library/.vite
 /AudioBooks/Presentation/library/dist/
+/.claude/
+/AudioBooks/Artifacts/

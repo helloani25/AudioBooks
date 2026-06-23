@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 from pathlib import Path
 
 from datasets import Dataset, DatasetDict, load_dataset, load_dataset_builder
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    # Optional dependency: script can run without loading .env files.
+    def load_dotenv(*_args, **_kwargs):  # type: ignore[override]
+        return False
 try:
     from gutenbergpy.textget import strip_headers
 except ImportError:  # pragma: no cover - optional dependency
@@ -22,13 +26,15 @@ from AudioBooks.Catalog.Gutenberg.db_utils import (
     connect_db as _connect_db,
     ensure_book_contents_table as _ensure_book_contents_table,
 )
+from AudioBooks.Catalog.Gutenberg.content_validation import (
+    detect_gutenberg_id_mismatch,
+    extract_ebook_gutenberg_id,
+)
 
 
 DATASET_NAME = "manu/project_gutenberg"
 DEFAULT_SPLIT = "en"
 DB_PATH = Path(__file__).resolve().parent.parent / "DB" / "gutenbergindex.db"
-GUTENBERG_ID_RE = re.compile(r"eBook\s*#(\d+)", re.IGNORECASE)
-
 load_dotenv()
 hf_token = os.getenv('HF_TOKEN')
 
@@ -92,9 +98,9 @@ def _extract_gutenberg_id(row: dict) -> int | None:
 
     text = row.get("text", "")
     if text:
-        match = GUTENBERG_ID_RE.search(text)
-        if match:
-            return int(match.group(1))
+        detected_id = extract_ebook_gutenberg_id(_to_text(text))
+        if detected_id is not None:
+            return detected_id
 
     return None
 
@@ -199,6 +205,7 @@ def _import_one_dataset(
     inserted = 0
     skipped_missing = 0
     skipped_existing = 0
+    skipped_mismatch = 0
 
     for index, row in enumerate(dataset):
         if limit is not None and index >= limit:
@@ -230,6 +237,16 @@ def _import_one_dataset(
             continue
 
         raw_text = _to_text(text)
+        is_mismatch, detected_id = detect_gutenberg_id_mismatch(raw_text, gutenberg_id)
+        if is_mismatch:
+            skipped_mismatch += 1
+            if skipped_mismatch <= 5:
+                print(
+                    f"{prefix}skip payload mismatch row={index}: "
+                    f"expected={gutenberg_id}, detected={detected_id}, book_id={book_id}"
+                )
+            continue
+
         try:
             clean_text = _to_text(strip_headers(raw_text.encode("utf-8")))
         except Exception:
@@ -250,11 +267,13 @@ def _import_one_dataset(
         "inserted": inserted,
         "skipped_missing": skipped_missing,
         "skipped_existing": skipped_existing,
+        "skipped_mismatch": skipped_mismatch,
     }
     print(
         f"{prefix}done: "
         f"matched={matched}, inserted={inserted}, "
-        f"skipped_missing={skipped_missing}, skipped_existing={skipped_existing}"
+        f"skipped_missing={skipped_missing}, skipped_existing={skipped_existing}, "
+        f"skipped_mismatch={skipped_mismatch}"
     )
     return stats
 
@@ -276,6 +295,7 @@ def import_dataset(
         "inserted": 0,
         "skipped_missing": 0,
         "skipped_existing": 0,
+        "skipped_mismatch": 0,
     }
 
     if isinstance(dataset, DatasetDict):
@@ -309,7 +329,8 @@ def import_dataset(
         "overall: "
         f"matched={total_stats['matched']}, inserted={total_stats['inserted']}, "
         f"skipped_missing={total_stats['skipped_missing']}, "
-        f"skipped_existing={total_stats['skipped_existing']}"
+        f"skipped_existing={total_stats['skipped_existing']}, "
+        f"skipped_mismatch={total_stats['skipped_mismatch']}"
     )
 
 

@@ -1,3 +1,62 @@
+// ── home.js ───────────────────────────────────────────────────────────────────
+//
+// Entry point for home.html. Handles two distinct views controlled by the URL:
+//
+//   home.html                  → Main catalog view
+//   home.html?view=recent      → Recently-played view
+//   home.html?category=Fiction → Pre-selects a category on load
+//   home.html?search=<query>   → Pre-fills the search field on load
+//
+// ── Main catalog view layout ──────────────────────────────────────────────────
+//
+//  ┌──────────────────────── topbar ─────────────────────────────────────────┐
+//  │ logo │ Home | Categories ▼ | Recently Played │ [search]   [Logout]     │
+//  └─────────────────────────────────────────────────────────────────────────┘
+//  ┌──── sidebar ────┐ ┌──────────────────── content ────────────────────────┐
+//  │ Featured        │ │  ┌── hero ──────────────────────────────────────┐   │
+//  │ Fiction         │ │  │ eyebrow · headline · tagline │ resume card   │   │
+//  │ Science fiction │ │  └─────────────────────────────────────────────┘   │
+//  │ History         │ │  ┌── category-grid ─────────────────────────────┐  │
+//  │ ...             │ │  │ Trending | Science fiction | Classic fiction  │  │
+//  │ (renderSidebar) │ │  └─────────────────────────────────────────────┘   │
+//  │                 │ │  ┌── most-downloaded-panel ─────────────────────┐  │
+//  │                 │ │  │ section title + no-match banner               │  │
+//  │                 │ │  │ ┌─ downloads-list (renderDownloads) ────────┐ │  │
+//  │                 │ │  │ │  [card] [card] [card] ...                 │ │  │
+//  │                 │ │  │ └───────────────────────────────────────────┘ │  │
+//  │                 │ │  │ ┌─ pagination (renderPagination) ────────────┐ │  │
+//  │                 │ │  │ │  Prev  1  2  3 ...  Next                  │ │  │
+//  │                 │ │  │ └───────────────────────────────────────────┘ │  │
+//  │                 │ │  └─────────────────────────────────────────────┘  │
+//  └─────────────────┘ └────────────────────────────────────────────────────┘
+//
+// ── Recently-played view layout ───────────────────────────────────────────────
+//
+//  ┌──────────────────────── topbar ─────────────────────────────────────────┐
+//  └─────────────────────────────────────────────────────────────────────────┘
+//  ┌──────────────────── content ────────────────────────────────────────────┐
+//  │ ┌── resume card (loadRecentResumeCard) ────────────────────────────┐    │
+//  │ │ eyebrow · title · meta · progress bar · Resume button           │    │
+//  │ └─────────────────────────────────────────────────────────────────┘    │
+//  │ ┌── recently-played-panel (renderRecentlyPlayedPanel) ─────────────┐   │
+//  │ │  [card] [card] [card] ...                                        │   │
+//  │ └─────────────────────────────────────────────────────────────────┘   │
+//  └────────────────────────────────────────────────────────────────────────┘
+//
+// ── Data flow ─────────────────────────────────────────────────────────────────
+//
+//  init()
+//   └─ initHomeView()
+//       ├─ renderRecentlyPlayedPanel()  → /api/media-history/recent
+//       ├─ loadRecentResumeCard()       → /api/media-history/last
+//       ├─ fetchWithTimeout(/api/subjects) → renderSidebar()
+//       ├─ loadPage()
+//       │   └─ fetchBooks()             → /api/books?limit&offset&subject&search
+//       │       ├─ renderDownloads()    → book card grid
+//       │       ├─ renderPagination()   → prev/page-numbers/next
+//       │       └─ updateSectionTitle() → section heading + no-match banner
+//       └─ [search + category click handlers] → reset state → loadPage()
+//
 import "./style.css";
 
 const app = document.querySelector("#app");
@@ -29,6 +88,8 @@ const DEFAULT_COVER_ART = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent
 </svg>
 `)}`;
 
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
 const escapeHtml = (value) =>
   String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -58,6 +119,11 @@ const fetchWithTimeout = async (input, init = {}, timeoutMs = REQUEST_TIMEOUT_MS
     window.clearTimeout(timeoutId);
   }
 };
+
+// ── Cover art cache (sessionStorage) ─────────────────────────────────────────
+// Each book card fetches its cover asynchronously. We cache the result in
+// sessionStorage so that navigating back to the home page doesn't re-fetch
+// every card's artwork on render.
 
 const saveCoverArtSnapshot = (bookId, covers) => {
   try {
@@ -153,6 +219,12 @@ const getResumeCopy = (item) => {
   };
 };
 
+// ── Resume card (hero section / last-played card) ─────────────────────────────
+// Populates the "Continue listening / reading" hero card visible on both views.
+// Fetches the single most-recent media history entry and fills in the book
+// title, kicker text ("Continue listening"), a rough progress bar width, and
+// the click handler that navigates to the correct book tab.
+
 const loadRecentResumeCard = async () => {
   const card = document.querySelector("#resume-card");
   const kickerEl = document.querySelector("#resume-kicker");
@@ -219,6 +291,12 @@ const loadRecentResumeCard = async () => {
     buttonEl.disabled = true;
   }
 };
+
+// ── Categories dropdown (topbar nav) ─────────────────────────────────────────
+// The "Categories" button in the topbar opens a dropdown populated from
+// /api/subjects. "Featured" is always prepended as the first item.
+// The dropdown state (open/closed, loaded/loading) is managed via module-level
+// variables and the data-bound attribute guards against double-binding listeners.
 
 const normalizeCategoryNames = (subjects) => {
   const names = ["Featured"];
@@ -330,6 +408,12 @@ const initAuthRedirect = async () => {
     return false;
   }
 };
+
+// ── Shell templates ───────────────────────────────────────────────────────────
+// The shell is written once into app.innerHTML before any data loads.
+// It establishes all the DOM IDs that the rest of the code queries and fills.
+// renderRecentHomeShell() → recently-played view (topbar + resume card + history list)
+// renderHomeShell()       → main catalog view (topbar + sidebar + hero + book grid)
 
 const renderRecentHomeShell = () => `
   <main class="home recent-page">
@@ -483,8 +567,14 @@ const renderHomeShell = () => isRecentView ? renderRecentHomeShell() : `
 
         <section class="downloads" id="most-downloaded-panel">
           <div class="section-header">
-            <h2>Most downloaded from Gutenberg</h2>
-            <p>Top titles based on total downloads in the index.</p>
+            <div id="no-match-section" class="no-match-section" hidden>
+              <div id="no-match-message" class="no-match-message"></div>
+              <div id="no-match-dog" class="no-match-dog" aria-hidden="true">☹️ 🐶</div>
+            </div>
+            <div class="downloads-heading-section">
+              <h2>Most downloaded from Gutenberg</h2>
+              <p>Top titles based on total downloads in the index.</p>
+            </div>
           </div>
           <div id="top-downloads" class="downloads-list">Loading titles...</div>
           <div id="downloads-pagination" class="pagination" aria-label="Pagination"></div>
@@ -495,6 +585,10 @@ const renderHomeShell = () => isRecentView ? renderRecentHomeShell() : `
 `;
 
 app.innerHTML = renderHomeShell();
+
+// ── Page state ────────────────────────────────────────────────────────────────
+// Mutable state for the catalog view. selectedCategory and currentSearch
+// drive which API query is made; currentPage / currentOffset drive pagination.
 
 let downloadsEl = null;
 let categoriesEl = null;
@@ -557,6 +651,11 @@ const describeRecentPosition = (item) => {
   const timeLabel = formatElapsed(position.current_time);
   return timeLabel ? `Continue listening · Track ${trackOrder + 1} · ${timeLabel}` : `Continue listening · Track ${trackOrder + 1}`;
 };
+
+// ── Recently-played panel ─────────────────────────────────────────────────────
+// Renders the scrollable list of recently-played book cards below the resume
+// card. Each card shows cover art, a "Continue reading/listening" kicker,
+// the book title, and chapter/track position. Clicking navigates to book.html.
 
 const renderRecentlyPlayedPanel = async () => {
   if (!recentlyPlayedListEl) return;
@@ -649,6 +748,11 @@ const renderRecentlyPlayedPanel = async () => {
   }
 };
 
+// ── Sidebar (left column, main catalog view) ──────────────────────────────────
+// Renders the category list in the left sidebar. "Featured" is always first.
+// Clicking a category resets pagination, updates selectedCategory, and calls
+// loadPage(). The active class highlights the currently selected category.
+
 const renderSidebar = () => {
   if (!categoriesEl) return;
 
@@ -693,6 +797,12 @@ const renderSidebar = () => {
     categoriesEl.appendChild(link);
   });
 };
+
+// ── Book card grid (most-downloaded-panel) ────────────────────────────────────
+// Renders book cards into #top-downloads. Each card shows: cover art (fetched
+// async and cached), title, author + year + language, subject tags, download
+// count, and an "Open book" CTA. Clicking a subject tag filters the grid to
+// that category without a full page reload.
 
 const renderDownloads = (books, clear = false) => {
   if (!downloadsEl) return;
@@ -793,6 +903,11 @@ const renderDownloads = (books, clear = false) => {
   });
 };
 
+// ── Pagination bar ────────────────────────────────────────────────────────────
+// Renders Prev / numbered pages / Next into #downloads-pagination.
+// Uses an ellipsis pattern for large page counts: always shows first, last,
+// and a window of ±1 around the current page.
+
 const renderPagination = () => {
   if (!paginationEl) return;
 
@@ -863,10 +978,23 @@ const renderPagination = () => {
   paginationEl.appendChild(makeButton("Next", Math.min(totalPages, currentPage + 1), currentPage === totalPages));
 };
 
+// ── Section title + no-match banner ──────────────────────────────────────────
+// Updates the h2 heading above the book grid to reflect the active state:
+//   Featured + no search  → "Most downloaded from Gutenberg"
+//   search with results   → "Search results for <query>"
+//   subject selected      → "Books in <subject>"
+//   search with no match  → heading stays default + no-match banner shown
+// Also shows/hides the hero strip and category-grid tiles on category change.
+
 const updateSectionTitle = () => {
-  const sectionTitle = document.querySelector(".downloads h2");
+  const downloadsPanelEl = document.querySelector("#most-downloaded-panel");
+  const sectionTitle = downloadsPanelEl ? downloadsPanelEl.querySelector(".section-header h2") : null;
+  const noMatchSectionEl = downloadsPanelEl ? downloadsPanelEl.querySelector("#no-match-section") : null;
+  const noMatchMessageEl = downloadsPanelEl ? downloadsPanelEl.querySelector("#no-match-message") : null;
+  const sectionSubtitle = downloadsPanelEl ? downloadsPanelEl.querySelector(".section-header p") : null;
   const heroEl = document.querySelector(".hero");
   const categoryGridEl = document.querySelector(".category-grid");
+  const defaultSubtitle = "Top titles based on total downloads in the index.";
 
   const isFeatured = selectedCategory === "Featured" && !currentSearch;
 
@@ -875,14 +1003,25 @@ const updateSectionTitle = () => {
 
   if (sectionTitle) {
     if (lastSearchHadNoResults && currentSearch) {
-      sectionTitle.textContent = `No results for "${currentSearch}" — showing popular titles`;
+      if (downloadsPanelEl) downloadsPanelEl.classList.add("no-search-match");
+      if (noMatchSectionEl) noMatchSectionEl.hidden = false;
+      if (noMatchMessageEl) {
+        noMatchMessageEl.textContent = `No match found for ${currentSearch}`;
+      }
+      sectionTitle.textContent = "Most downloaded from Gutenberg";
+      if (sectionSubtitle) sectionSubtitle.textContent = defaultSubtitle;
     } else {
+      if (downloadsPanelEl) downloadsPanelEl.classList.remove("no-search-match");
+      if (noMatchSectionEl) noMatchSectionEl.hidden = true;
       sectionTitle.textContent = selectedCategory === "Featured"
         ? (currentSearch ? `Search results for "${currentSearch}"` : "Most downloaded from Gutenberg")
         : `Books in ${selectedCategory}`;
+      if (sectionSubtitle) sectionSubtitle.textContent = defaultSubtitle;
     }
   }
 };
+
+// ── Data fetching ─────────────────────────────────────────────────────────────
 
 const fetchBooks = async (subject = null, search = null) => {
   let url = `/api/books?limit=${LIMIT}&offset=${currentOffset}`;
@@ -912,21 +1051,47 @@ const fetchBooks = async (subject = null, search = null) => {
             : typeof countData.total === "number"
               ? countData.total
               : data.length;
-        return { books: data, total };
+        return {
+          books: data,
+          total,
+          noMatchMessage: null,
+          fallbackBooks: [],
+          fallbackTotal: 0,
+        };
       } catch (err) {
         console.warn("Count fetch failed:", err);
-        return { books: data, total: data.length };
+        return {
+          books: data,
+          total: data.length,
+          noMatchMessage: null,
+          fallbackBooks: [],
+          fallbackTotal: 0,
+        };
       }
     }
     return {
       books: data.books || [],
       total: typeof data.total === "number" ? data.total : (data.books || []).length,
+      noMatchMessage: typeof data.no_match_message === "string" ? data.no_match_message : null,
+      fallbackBooks: Array.isArray(data.fallback_books) ? data.fallback_books : [],
+      fallbackTotal: typeof data.fallback_total === "number" ? data.fallback_total : 0,
     };
   } catch (err) {
     console.error("Error fetching books:", err);
-    return { books: [], total: 0 };
+    return {
+      books: [],
+      total: 0,
+      noMatchMessage: null,
+      fallbackBooks: [],
+      fallbackTotal: 0,
+    };
   }
 };
+
+// loadPage() is the central render cycle for the catalog view.
+// It fetches the current page of books, handles the no-match fallback (shows
+// popular books when a search returns zero results), then calls renderDownloads,
+// renderPagination, and updateSectionTitle to refresh the visible UI.
 
 const loadPage = async () => {
   if (!downloadsEl) return;
@@ -934,18 +1099,33 @@ const loadPage = async () => {
   currentOffset = (currentPage - 1) * LIMIT;
   const subject = selectedCategory === "Featured" ? null : selectedCategory;
   try {
-    const { books, total } = await fetchBooks(subject, currentSearch);
+    const {
+      books,
+      total,
+      fallbackBooks,
+      fallbackTotal,
+    } = await fetchBooks(subject, currentSearch);
+    let booksToRender = books;
+    let totalToRender = total;
+    let shouldShowNoMatchWarning = false;
+
     if (currentSearch && books.length === 0) {
-      // No matches for the search — fall back to popular titles
-      lastSearchHadNoResults = true;
-      const fallback = await fetchBooks(null, null);
-      totalPages = Math.max(1, Math.ceil(fallback.total / LIMIT));
-      renderDownloads(fallback.books, true);
-    } else {
-      lastSearchHadNoResults = false;
-      totalPages = Math.max(1, Math.ceil(total / LIMIT));
-      renderDownloads(books, true);
+      const hasFallbackBooks = Array.isArray(fallbackBooks) && fallbackBooks.length > 0;
+      if (hasFallbackBooks) {
+        booksToRender = fallbackBooks;
+        totalToRender = fallbackTotal > 0 ? fallbackTotal : fallbackBooks.length;
+      } else {
+        const fallback = await fetchBooks(null, null);
+        booksToRender = Array.isArray(fallback.books) ? fallback.books : [];
+        totalToRender = fallback.total;
+      }
+      // Only show the "no match" warning state when nothing is rendered.
+      shouldShowNoMatchWarning = booksToRender.length === 0;
     }
+
+    lastSearchHadNoResults = shouldShowNoMatchWarning;
+    totalPages = Math.max(1, Math.ceil(totalToRender / LIMIT));
+    renderDownloads(booksToRender, true);
     renderPagination();
     updateSectionTitle();
   } catch (error) {
@@ -953,6 +1133,13 @@ const loadPage = async () => {
     downloadsEl.innerHTML = '<div class="empty-state">Unable to load Gutenberg titles right now.</div>';
   }
 };
+
+// ── Initialisation ────────────────────────────────────────────────────────────
+// initHomeView() resolves DOM refs, loads initial data, and wires up all event
+// listeners. For the recent view it short-circuits after loading the resume
+// card and history list. For the catalog view it also fetches subjects,
+// initialises the selected category/search from URL params, and sets up
+// the search bar, category tile clicks, and sidebar link handlers.
 
 const initHomeView = async () => {
   downloadsEl = document.querySelector("#top-downloads");
@@ -962,6 +1149,15 @@ const initHomeView = async () => {
   recentlyPlayedListEl = document.querySelector("#recently-played-list");
   const searchInput = document.querySelector(".search input");
   const searchIcon = document.querySelector(".search-icon");
+
+  if (searchInput) {
+    searchInput.addEventListener("dblclick", () => {
+      window.setTimeout(() => {
+        searchInput.focus();
+        searchInput.setSelectionRange(0, searchInput.value.length);
+      }, 0);
+    });
+  }
 
   try {
     await renderRecentlyPlayedPanel();

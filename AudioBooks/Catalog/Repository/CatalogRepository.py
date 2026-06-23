@@ -5,6 +5,12 @@ import os
 import re
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from AudioBooks.Catalog.Gutenberg.content_validation import detect_gutenberg_id_mismatch
+
 try:
     import redis
 except ImportError:  # pragma: no cover - optional dependency
@@ -418,6 +424,17 @@ class CatalogRepository:
         raw_text = raw_content.decode('utf-8', errors='ignore') if isinstance(raw_content, bytes) else raw_content
         clean_text = clean_content.decode('utf-8', errors='ignore') if isinstance(clean_content, bytes) else clean_content
 
+        cur.execute("SELECT gutenbergbookid FROM books WHERE id = ?", (book_id,))
+        row = cur.fetchone()
+        expected_gutenberg_id = int(row[0]) if row and row[0] is not None else None
+        is_mismatch, detected_id = detect_gutenberg_id_mismatch(raw_text, expected_gutenberg_id)
+        if is_mismatch:
+            conn.close()
+            raise ValueError(
+                f"payload Gutenberg ID mismatch for book_id={book_id}: "
+                f"expected={expected_gutenberg_id}, detected={detected_id}"
+            )
+
         # Use INSERT OR REPLACE to handle duplicates
         cur.execute("""
             INSERT OR REPLACE INTO book_contents (bookid, raw_content, clean_content, download_date)
@@ -433,7 +450,12 @@ class CatalogRepository:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
 
-        cur.execute("SELECT bookid, raw_content, clean_content, download_date FROM book_contents WHERE bookid = ?", (book_id,))
+        cur.execute(
+            "SELECT bookid, raw_content, clean_content, content_type,"
+            "       html_content, has_images, download_date"
+            " FROM book_contents WHERE bookid = ?",
+            (book_id,),
+        )
         row = cur.fetchone()
         conn.close()
 
@@ -442,9 +464,21 @@ class CatalogRepository:
                 "bookid": row["bookid"],
                 "raw_content": row["raw_content"],
                 "clean_content": row["clean_content"],
-                "download_date": row["download_date"]
+                "content_type": row["content_type"] if row["content_type"] else "text",
+                "html_content": row["html_content"],
+                "has_images": bool(row["has_images"]),
+                "download_date": row["download_date"],
             }
         return None
+
+    def get_book_gutenberg_id(self, book_id: int) -> int | None:
+        """Return the Gutenberg ID for an internal book_id, or None if not found."""
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT gutenbergbookid FROM books WHERE id = ?", (book_id,))
+        row = cur.fetchone()
+        conn.close()
+        return int(row[0]) if row and row[0] is not None else None
 
     def save_book_audio(
         self,

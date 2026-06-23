@@ -72,6 +72,12 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from AudioBooks.Catalog.Gutenberg.content_validation import detect_gutenberg_id_mismatch
+
 DB_PATH = Path(__file__).resolve().parent.parent / "DB" / "gutenbergindex.db"
 
 MP3_DOWNLOAD_TYPE_ID = 11
@@ -225,7 +231,15 @@ def _migrate_desc(cur: sqlite3.Cursor, source_id: int, target_id: int, dry_run: 
     _log(f"  [book_desc] {action} source description (source={src_desc['source']}) → book_id={target_id}.")
 
 
-def _migrate_contents(cur: sqlite3.Cursor, source_id: int, target_id: int, dry_run: bool) -> None:
+def _migrate_contents(
+    cur: sqlite3.Cursor,
+    source_id: int,
+    target_id: int,
+    dry_run: bool,
+    *,
+    source_gutenberg_id: int | None,
+    target_gutenberg_id: int | None,
+) -> None:
     cur.execute("SELECT length(raw_content) AS sz, raw_content, clean_content FROM book_contents WHERE bookid = ?", (target_id,))
     target_row = cur.fetchone()
     cur.execute("SELECT length(raw_content) AS sz, raw_content, clean_content FROM book_contents WHERE bookid = ?", (source_id,))
@@ -235,8 +249,33 @@ def _migrate_contents(cur: sqlite3.Cursor, source_id: int, target_id: int, dry_r
         _log("  [book_contents] source has no content — skipping.")
         return
 
+    if source_gutenberg_id is not None and target_gutenberg_id is not None and source_gutenberg_id != target_gutenberg_id:
+        _log(
+            "  [book_contents] source/target Gutenberg IDs differ "
+            f"({source_gutenberg_id} vs {target_gutenberg_id}) — skipping content migration."
+        )
+        return
+
+    source_mismatch, source_detected_id = detect_gutenberg_id_mismatch(source_row["raw_content"], source_gutenberg_id)
+    if source_mismatch:
+        _log(
+            "  [book_contents] source payload Gutenberg ID mismatch "
+            f"(expected={source_gutenberg_id}, detected={source_detected_id}) — skipping."
+        )
+        return
+
+    target_invalid = False
+    if target_row:
+        target_mismatch, target_detected_id = detect_gutenberg_id_mismatch(target_row["raw_content"], target_gutenberg_id)
+        if target_mismatch:
+            target_invalid = True
+            _log(
+                "  [book_contents] target payload Gutenberg ID mismatch "
+                f"(expected={target_gutenberg_id}, detected={target_detected_id}) — treating as invalid."
+            )
+
     src_sz = source_row["sz"] or 0
-    tgt_sz = target_row["sz"] if target_row else 0
+    tgt_sz = 0 if target_invalid else (target_row["sz"] if target_row else 0)
 
     if tgt_sz >= src_sz:
         _log(f"  [book_contents] target content is equal or larger ({tgt_sz} vs {src_sz} bytes) — keeping target.")
@@ -441,7 +480,14 @@ def merge(source_id: int, target_id: int, *, conn: sqlite3.Connection, dry_run: 
 
     _log(f"Merging book_id={source_id} (gutenberg={found[source_id]}) → book_id={target_id} (gutenberg={found[target_id]})")
     _migrate_desc(cur, source_id, target_id, dry_run)
-    _migrate_contents(cur, source_id, target_id, dry_run)
+    _migrate_contents(
+        cur,
+        source_id,
+        target_id,
+        dry_run,
+        source_gutenberg_id=int(found[source_id]) if found[source_id] is not None else None,
+        target_gutenberg_id=int(found[target_id]) if found[target_id] is not None else None,
+    )
     _migrate_audio(cur, source_id, target_id, dry_run)
     _self_fill_audio_from_downloadlinks(cur, target_id, dry_run)
     _migrate_cover_art(cur, source_id, target_id, dry_run)

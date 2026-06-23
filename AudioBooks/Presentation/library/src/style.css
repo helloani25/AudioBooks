@@ -622,6 +622,43 @@ body {
   color: var(--ink-soft);
 }
 
+.downloads.no-search-match .section-header {
+  display: grid;
+  gap: 14px;
+}
+
+.no-match-section {
+  background: linear-gradient(135deg, #fff3f3 0%, #ffe7e7 100%);
+  border: 1px solid #e8a1a1;
+  border-left: 6px solid #cf5454;
+  border-radius: 14px;
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.65);
+}
+
+.no-match-section[hidden] {
+  display: none;
+}
+
+.no-match-message {
+  margin: 0;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: #8f2323;
+}
+
+.no-match-dog {
+  font-size: 2rem;
+  line-height: 1;
+  margin: 0;
+}
+
+.downloads-heading-section {
+  padding-top: 2px;
+}
+
 .downloads-list {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -736,7 +773,9 @@ body {
 }
 
 .read-main {
-  flex: 1;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
   min-height: 0;
   overflow-y: auto;
 }
@@ -772,6 +811,7 @@ body {
 
 .book-meta-grid {
   display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: 12px;
   margin: 0;
 }
@@ -1025,6 +1065,8 @@ body[data-mode="video"] .book-hero p {
 
 .reader-content {
   min-width: 0;
+  width: 100%;
+  max-width: 100%;
 }
 
 .chapter-panel {
@@ -1034,6 +1076,8 @@ body[data-mode="video"] .book-hero p {
   padding: 18px;
   display: grid;
   gap: 12px;
+  width: 100%;
+  max-width: 100%;
 }
 
 .chapter-panel h3 {
@@ -1047,6 +1091,43 @@ body[data-mode="video"] .book-hero p {
   line-height: 1.75;
   color: var(--ink);
   font-family: inherit;
+  width: 100%;
+  max-width: 100%;
+}
+
+.book-html-content {
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.book-html-content img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 1rem auto;
+  border-radius: 6px;
+}
+
+.book-html-content p { margin: 0.75em 0; }
+.book-html-content h1,
+.book-html-content h2,
+.book-html-content h3,
+.book-html-content h4 {
+  font-family: "Fraunces", serif;
+  color: var(--ink);
+  margin: 1.5em 0 0.5em;
+}
+.book-html-content a { color: var(--accent); }
+.book-html-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+}
+.book-html-content td,
+.book-html-content th {
+  border: 1px solid #e0d8cc;
+  padding: 6px 10px;
 }
 
 .audio-track-body {

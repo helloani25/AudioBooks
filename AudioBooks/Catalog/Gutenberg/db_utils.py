@@ -52,10 +52,51 @@ def ensure_book_contents_table(db_path: str) -> None:
                     bookid INTEGER PRIMARY KEY,
                     raw_content TEXT NOT NULL,
                     clean_content TEXT NOT NULL,
+                    content_type TEXT NOT NULL DEFAULT 'text',
                     download_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
             )
+            conn.commit()
+        finally:
+            conn.close()
+
+    with_sqlite_retry(query)
+
+
+def migrate_book_contents_content_type(db_path: str) -> None:
+    """Add content_type column to book_contents if it doesn't exist yet."""
+    def query() -> None:
+        conn = connect_db(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(book_contents)")
+            cols = {row[1] for row in cur.fetchall()}
+            if "content_type" not in cols:
+                cur.execute(
+                    "ALTER TABLE book_contents ADD COLUMN content_type TEXT NOT NULL DEFAULT 'text'"
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+    with_sqlite_retry(query)
+
+
+def migrate_book_contents_html_content(db_path: str) -> None:
+    """Add html_content and has_images columns to book_contents if missing."""
+    def query() -> None:
+        conn = connect_db(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(book_contents)")
+            cols = {row[1] for row in cur.fetchall()}
+            if "html_content" not in cols:
+                cur.execute("ALTER TABLE book_contents ADD COLUMN html_content TEXT")
+            if "has_images" not in cols:
+                cur.execute(
+                    "ALTER TABLE book_contents ADD COLUMN has_images INTEGER NOT NULL DEFAULT 0"
+                )
             conn.commit()
         finally:
             conn.close()

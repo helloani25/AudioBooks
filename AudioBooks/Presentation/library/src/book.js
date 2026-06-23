@@ -1,3 +1,79 @@
+// ── book.js ───────────────────────────────────────────────────────────────────
+//
+// Entry point for book.html. Loads a single book by ?book=<id> and renders
+// a multi-tab detail page. The view is driven by `bookState.data` — a plain
+// object created by createBookState() and populated by loadBookDetail().
+//
+// ── Page layout ───────────────────────────────────────────────────────────────
+//
+//  ┌──────────────────────────── topbar ─────────────────────────────────────┐
+//  │ logo │ Home | Categories ▼ | Recently Played │ [search]    [Logout]    │
+//  └─────────────────────────────────────────────────────────────────────────┘
+//  ┌──────────────── book-layout ────────────────────────────────────────────┐
+//  │ ┌──── book-hero ──────────────────────────────────────────────────────┐ │
+//  │ │  [cover img]  │  eyebrow · h1 title · byline (author · year · lang)│ │
+//  │ └─────────────────────────────────────────────────────────────────────┘ │
+//  │ ┌──── book-tab-bar ───────────────────────────────────────────────────┐ │
+//  │ │  [About]  [Read]  [Listen]  [Video]                                │ │
+//  │ └─────────────────────────────────────────────────────────────────────┘ │
+//  │                                                                         │
+//  │  ── tab-about (About tab) ──────────────────────────────────────────── │
+//  │  │  summary paragraph                                                  │ │
+//  │  │  book-meta-grid  (Author | Translator | Narrator | Language | ...)  │ │
+//  │  │  media-tags      (Text · Audio · Video availability badges)        │ │
+//  │                                                                         │
+//  │  ── tab-read (Read tab) ────────────────────────────────────────────── │
+//  │  ┌── book-sidebar ────┐  ┌── read-main ──────────────────────────────┐ │
+//  │  │ chapter-panel-title│  │ #reader-title   (chapter heading)         │ │
+//  │  │ #book-chapters     │  │ #reader-subtitle                          │ │
+//  │  │  (chapter list)    │  │ #reader-content                           │ │
+//  │  │ #chapter-pagination│  │   plain text → pre-wrap paragraphs        │ │
+//  │  └────────────────────┘  │   HTML edition → DOMParser + inline images│ │
+//  │                          └───────────────────────────────────────────┘ │
+//  │                                                                         │
+//  │  ── tab-listen (Listen tab) ────────────────────────────────────────── │
+//  │  ┌── listen-player-panel ──────────────────────────────────────────┐   │
+//  │  │  now-playing header · <audio> element · format/narrator meta   │   │
+//  │  └────────────────────────────────────────────────────────────────┘   │
+//  │  ┌── listen-playlist ──────────────────────────────────────────────┐   │
+//  │  │  [track 1] [track 2] [track 3] ...                             │   │
+//  │  └────────────────────────────────────────────────────────────────┘   │
+//  └─────────────────────────────────────────────────────────────────────────┘
+//
+// ── State and rendering model ─────────────────────────────────────────────────
+//
+//  createBookState(bookId) → initial snapshot (all fields default/empty)
+//  loadBookDetail(bookId)  → fills snapshot from 4 parallel API calls:
+//                              /api/books/<id>/description  (summary, author, genres)
+//                              /api/books/<id>/content      (text or HTML, content_type)
+//                              /api/books/<id>/audio        (tracks, narrator)
+//                              /api/media-history/books/<id>(resume position)
+//
+//  renderBookState()       → top-level render driven by data.mode:
+//    mode = "about"  → About tab:  summary + metadata grid + media tags
+//    mode = "read"   → Read tab:   renderSidebarChapters() + renderReadPanel()
+//    mode = "listen" → Listen tab: renderListenPanel() → createAudioElement()
+//
+//  Tab switches call setActiveTab(tab) → sets data.mode → renderBookState()
+//
+// ── Audio playback ────────────────────────────────────────────────────────────
+//
+//  createAudioElement() creates the <audio> element and attaches it to the DOM.
+//  loadTrack(index) swaps the src and seeks to the saved position.
+//  Progress is saved to localStorage and to /api/media-history/books/<id>
+//  every 5 seconds via the timeupdate event.
+//  autoplayOnLoad is set to true when returning to a book that has an audio
+//  resume position, so the track starts playing on the first render.
+//
+// ── Read tab: plain text vs HTML edition ──────────────────────────────────────
+//
+//  content_type = "text"  → splitIntoChapters() parses heading lines into
+//                           chapter blocks; each block rendered as pre-wrap text
+//  content_type = "html"  → HTML from the -h.zip archive is sanitized,
+//                           Gutenberg boilerplate is removed, and chapter
+//                           anchors are built from HTML headings; images served through
+//                           /api/books/<id>/images/<filename> → signed GCS URL
+//
 import "./style.css";
 
 const app = document.querySelector("#app");
@@ -221,10 +297,7 @@ const describeRecentPosition = (item) => {
   return timeLabel ? `Continue listening · Track ${trackOrder + 1} · ${timeLabel}` : `Continue listening · Track ${trackOrder + 1}`;
 };
 
-const buildRecentBookUrl = (item) => buildBookUrl(
-  { id: item.book_id },
-  item.media_type === "audio" ? { autoplay: "1" } : {},
-);
+const buildRecentBookUrl = (item) => buildBookUrl({ id: item.book_id });
 
 const buildHomeCategoryUrl = (category) => {
   const nextUrl = new URL("/home.html", window.location.origin);
@@ -408,6 +481,7 @@ const renderBookShell = () => `
 
         <section id="tab-about" class="book-tab-panel" role="tabpanel">
           <p id="book-summary" class="book-summary"></p>
+          <div id="book-meta" class="book-meta"></div>
           <div id="book-media-tags" class="book-tags"></div>
         </section>
 
@@ -442,10 +516,22 @@ const renderBookShell = () => `
 
 app.innerHTML = renderBookShell();
 
-// ── Chapter parsing ───────────────────────────────────────────────────────────
+// ── Chapter parsing (Read tab — plain text only) ─────────────────────────────
+// splitIntoChapters() splits a plain-text book into chapter blocks by detecting
+// heading lines ("CHAPTER I", "PART TWO", etc.). selectChapterBlocks() dedupes
+// TOC lines from body headings by keeping the block with the most text.
+// These functions are only called for content_type='text'; HTML editions skip
+// splitting and are processed separately by buildHtmlReadingModel().
 
 const CHAPTER_HEADING_PATTERN = /^(?:chapter|book|part|section|act)\s+(?:[ivxlcdm]+|\d+)\b/i;
 const STRUCTURAL_PARENT_PATTERN = /^(?:book|part|volume)\s+(?:the\s+)?(?:one|two|three|four|five|six|seven|eight|nine|ten|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|eleventh|twelfth)\b/i;
+const HTML_CHAPTER_HEADING_PATTERN = /^(?:chapter|book|part|section|act|canto|scene)\b(?:\s+(?:[ivxlcdm]+|\d+|one|two|three|four|five|six|seven|eight|nine|ten|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth))?/i;
+const TOC_MARKER_PATTERN = /^(?:table of\s+)?contents\.?$/i;
+const TOC_PAGE_HEADER_PATTERN = /^page\.?$/i;
+const TOC_ENTRY_PATTERN = /^(.*?\S)\s{2,}(\d{1,4})\s*$/;
+const GUTENBERG_HEADER_LINE_PATTERN = /^the project gutenberg ebook of\b/i;
+const GUTENBERG_TRAILER_LINE_PATTERN = /^(?:\*\*\*\s*)?end of (?:the|this) project gutenberg/i;
+const ROMAN_VALUES = Object.freeze({ I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1000 });
 
 const isChapterHeading = (line) => {
   const stripped = String(line ?? "").trim();
@@ -459,16 +545,44 @@ const isStructuralParent = (line) => {
   return STRUCTURAL_PARENT_PATTERN.test(stripped);
 };
 
+const romanToInt = (value) => {
+  const token = String(value ?? "").trim().toUpperCase();
+  if (!token || /[^IVXLCDM]/.test(token)) return null;
+  let total = 0;
+  let prev = 0;
+  for (let i = token.length - 1; i >= 0; i -= 1) {
+    const curr = ROMAN_VALUES[token[i]];
+    if (!curr) return null;
+    if (curr < prev) total -= curr;
+    else {
+      total += curr;
+      prev = curr;
+    }
+  }
+  return total > 0 ? total : null;
+};
+
 const normalizeChapterTitle = (title) => {
-  let normalized = String(title ?? "")
+  const source = String(title ?? "");
+  let normalized = source
     .replace(/\s+/g, " ")
     .trim()
     .replace(/[.]+$/g, "")
     .toUpperCase();
-  normalized = normalized.replace(
-    /^((?:CHAPTER|BOOK|PART|SECTION|ACT)\s+(?:[IVXLCDM]+|\d+))\s+.+$/,
-    "$1",
-  );
+
+  // Canonicalize heading keys so TOC lines like
+  // "CHAPTER I.--The Exterior" and body lines "CHAPTER I" dedupe together.
+  const headingMatch = source.trim().match(/^(CHAPTER|BOOK|PART|SECTION|ACT)\s+([IVXLCDM]+|\d+)\b/i);
+  if (headingMatch) {
+    const kind = headingMatch[1].toUpperCase();
+    const numToken = headingMatch[2];
+    const number = /^\d+$/.test(numToken) ? Number(numToken) : romanToInt(numToken);
+    if (Number.isFinite(number) && number > 0) {
+      normalized = `${kind} ${number}`;
+    } else {
+      normalized = `${kind} ${numToken.toUpperCase()}`;
+    }
+  }
   return normalized;
 };
 
@@ -496,11 +610,111 @@ const selectChapterBlocks = (blocks) => {
     .filter((block, index, array) => !(index === 0 && block.title === "Front Matter" && array.length > 1));
 };
 
-const splitIntoChapters = (text) => {
+const normalizeTocHeading = (value) =>
+  String(value ?? "")
+    .normalize("NFKD")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+
+const extractTocEntries = (rawText) => {
+  const text = String(rawText ?? "").replace(/\r\n/g, "\n");
+  if (!text) return [];
+
+  const lines = text.split("\n");
+  const maxScan = Math.min(lines.length, 5000);
+  let markerIdx = -1;
+  for (let i = 0; i < maxScan; i += 1) {
+    if (TOC_MARKER_PATTERN.test(lines[i].trim())) {
+      markerIdx = i;
+      break;
+    }
+  }
+  if (markerIdx < 0) return [];
+
+  const titles = [];
+  let pendingPrefix = "";
+  for (let i = markerIdx + 1; i < Math.min(lines.length, markerIdx + 2600); i += 1) {
+    const stripped = lines[i].trim();
+    if (!stripped) continue;
+    if (TOC_PAGE_HEADER_PATTERN.test(stripped)) continue;
+
+    const entryMatch = stripped.match(TOC_ENTRY_PATTERN);
+    if (entryMatch) {
+      const fullTitle = pendingPrefix ? `${pendingPrefix} ${entryMatch[1].trim()}` : entryMatch[1].trim();
+      pendingPrefix = "";
+      titles.push(fullTitle);
+      continue;
+    }
+
+    if (titles.length >= 8 && /^[A-Z][A-Z\s,'.\-&;:()]+$/.test(stripped)) break;
+
+    const normalized = normalizeTocHeading(stripped);
+    if (normalized && stripped.length <= 140) {
+      pendingPrefix = pendingPrefix ? `${pendingPrefix} ${stripped}` : stripped;
+      continue;
+    }
+
+    if (titles.length >= 8) break;
+  }
+  return titles;
+};
+
+const splitByTocHeadings = (cleanText, rawText) => {
+  const tocTitles = extractTocEntries(rawText);
+  if (tocTitles.length < 8) return null;
+
+  const lines = cleanText.split("\n");
+  const headingCandidates = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const stripped = lines[index].trim();
+    if (!stripped || stripped.length > 220) continue;
+    const normalized = normalizeTocHeading(stripped);
+    if (!normalized) continue;
+    headingCandidates.push({ index, normalized });
+  }
+
+  const matched = [];
+  let cursor = 0;
+  for (const title of tocTitles) {
+    const wanted = normalizeTocHeading(title);
+    if (!wanted) continue;
+    let foundAt = -1;
+    for (let i = cursor; i < headingCandidates.length; i += 1) {
+      if (headingCandidates[i].normalized === wanted) {
+        foundAt = i;
+        break;
+      }
+    }
+    if (foundAt < 0) continue;
+    matched.push({ title, lineIndex: headingCandidates[foundAt].index });
+    cursor = foundAt + 1;
+  }
+
+  if (matched.length < 6) return null;
+
+  const blocks = [];
+  for (let i = 0; i < matched.length; i += 1) {
+    const start = matched[i].lineIndex;
+    const end = i + 1 < matched.length ? matched[i + 1].lineIndex : lines.length;
+    const text = lines.slice(start, end).join("\n").trim();
+    if (!text) continue;
+    blocks.push({ title: matched[i].title, text });
+  }
+
+  return blocks.length >= 2 ? blocks : null;
+};
+
+const splitIntoChapters = (text, rawText = "") => {
   const cleanText = String(text ?? "").replace(/\r\n/g, "\n").trim();
   if (!cleanText) return [];
   const lines = cleanText.split("\n");
-  if (!lines.some(isChapterHeading)) return [{ title: "Full Text", text: cleanText }];
+  if (!lines.some(isChapterHeading)) {
+    const tocBlocks = splitByTocHeadings(cleanText, rawText);
+    if (tocBlocks) return tocBlocks;
+    return [{ title: "Full Text", text: cleanText }];
+  }
   const blocks = [];
   let currentTitle = "Front Matter";
   let currentParent = null;
@@ -513,7 +727,7 @@ const splitIntoChapters = (text) => {
         blocks.push({ title: currentTitle, parentContext: currentParent, text: currentLines.join("\n").trim() });
       }
       currentTitle = line.trim();
-      currentLines = [line];
+      currentLines = [];
       continue;
     }
     if (isStructuralParent(line)) currentParent = line.trim();
@@ -527,6 +741,129 @@ const splitIntoChapters = (text) => {
   return selectChapterBlocks(cleaned);
 };
 
+const normalizeWhitespace = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+
+const sanitizeHtmlDocument = (doc) => {
+  doc.querySelectorAll("script").forEach((el) => el.remove());
+  doc.querySelectorAll("*").forEach((el) => {
+    [...el.attributes].forEach((attr) => {
+      if (attr.name.startsWith("on")) {
+        el.removeAttribute(attr.name);
+      }
+    });
+  });
+};
+
+const stripGutenbergBoilerplate = (doc) => {
+  // Gutenberg HTML commonly wraps legal boilerplate in these containers.
+  [
+    "#pg-header",
+    "#pg-footer",
+    ".pg-header",
+    ".pg-footer",
+    ".pg-boilerplate",
+    ".x-ebookmaker-drop",
+  ].forEach((selector) => {
+    doc.querySelectorAll(selector).forEach((el) => el.remove());
+  });
+
+  // Fallback when explicit Gutenberg wrappers are absent.
+  const topBlocks = Array.from(doc.body.children).slice(0, 12);
+  topBlocks.forEach((el) => {
+    const text = normalizeWhitespace(el.textContent).toLowerCase();
+    if (!text) return;
+    if (GUTENBERG_HEADER_LINE_PATTERN.test(text)) {
+      el.remove();
+    }
+  });
+
+  // Remove trailing Gutenberg license/footer if present inline.
+  const candidates = Array.from(doc.body.querySelectorAll("p,div,section,article,footer"));
+  const trailerNode = candidates.find((el) => GUTENBERG_TRAILER_LINE_PATTERN.test(normalizeWhitespace(el.textContent)));
+  if (trailerNode && trailerNode.parentNode) {
+    let cursor = trailerNode;
+    while (cursor) {
+      const next = cursor.nextSibling;
+      cursor.remove();
+      cursor = next;
+    }
+  }
+};
+
+const isLikelyHtmlChapterHeading = (line) => {
+  const text = normalizeWhitespace(line);
+  if (!text || text.length > 180) return false;
+  if (/^(contents|table of contents)\b/i.test(text)) return false;
+  return HTML_CHAPTER_HEADING_PATTERN.test(text);
+};
+
+const getHeadingCandidates = (doc) => {
+  const headingEls = Array.from(doc.body.querySelectorAll("h1,h2,h3,h4,h5,h6"));
+  const semanticEls = Array.from(
+    doc.body.querySelectorAll(
+      [
+        "[class*='chapter']",
+        "[id*='chapter']",
+        "[class*='book'][class*='title']",
+        "[class*='part'][class*='title']",
+      ].join(",")
+    )
+  );
+  const seen = new Set();
+  return [...headingEls, ...semanticEls].filter((el) => {
+    if (seen.has(el)) return false;
+    seen.add(el);
+    return true;
+  });
+};
+
+const buildHtmlReadingModel = (htmlText, fallbackTitle) => {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(String(htmlText ?? ""), "text/html");
+  sanitizeHtmlDocument(doc);
+  stripGutenbergBoilerplate(doc);
+
+  const candidates = getHeadingCandidates(doc).filter((el) => {
+    const text = normalizeWhitespace(el.textContent);
+    if (!isLikelyHtmlChapterHeading(text)) return false;
+    // Keep heading-like elements, not large containers.
+    if (!/^H[1-6]$/.test(el.tagName) && el.querySelector("p,div,section,article,table,ul,ol")) return false;
+    return true;
+  });
+
+  const chapters = [];
+  candidates.forEach((el, i) => {
+    const anchorId = `ab-chapter-${i + 1}`;
+    el.id = anchorId;
+    chapters.push({
+      title: normalizeWhitespace(el.textContent),
+      isHtml: true,
+      anchorId,
+    });
+  });
+
+  if (chapters.length === 0) {
+    chapters.push({
+      title: fallbackTitle || "Full Text",
+      isHtml: true,
+      anchorId: null,
+    });
+  }
+
+  return {
+    fullHtml: doc.body.innerHTML,
+    chapters,
+  };
+};
+
+const extractHtmlSummaryText = (htmlText, maxLength = 400) => {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(String(htmlText ?? ""), "text/html");
+  sanitizeHtmlDocument(doc);
+  stripGutenbergBoilerplate(doc);
+  return normalizeWhitespace(doc.body.textContent).slice(0, maxLength);
+};
+
 const renderDefinitionList = (items) => `
   <dl class="book-meta-grid">
     ${items.map(([label, value]) => `
@@ -537,12 +874,17 @@ const renderDefinitionList = (items) => `
   </dl>
 `;
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── Book state ────────────────────────────────────────────────────────────────
+// createBookState() defines the full shape of the page's mutable state.
+// bookState.data holds the single live instance; all render functions read from
+// it rather than keeping their own local copies.
+// getBookRefs() resolves all stable DOM IDs after the shell has been injected.
 
 const createBookState = (bookId) => ({
   id: bookId,
   title: `Book ${bookId}`,
   authors: "",
+  translator: "",
   year: "",
   language: "",
   downloads: "",
@@ -554,6 +896,7 @@ const createBookState = (bookId) => ({
   audioChapters: [],
   audio: null,
   content: null,
+  htmlFullContent: "",
   hasAudio: false,
   hasVideo: false,
   mode: "about",
@@ -569,6 +912,7 @@ const createBookState = (bookId) => ({
   coverArt: [],
   audioEl: null,
   readMainEl: null,
+  autoplayOnLoad: false,
 });
 
 const bookState = { data: null };
@@ -583,6 +927,7 @@ const getBookRefs = () => ({
   tabListen:        document.querySelector("#tab-listen"),
   tabVideo:         document.querySelector("#tab-video"),
   summary:          document.querySelector("#book-summary"),
+  bookMeta:         document.querySelector("#book-meta"),
   mediaTags:        document.querySelector("#book-media-tags"),
   chapterPanelTitle: document.querySelector("#chapter-panel-title"),
   chapters:         document.querySelector("#book-chapters"),
@@ -595,6 +940,9 @@ const getBookRefs = () => ({
 });
 
 // ── Tab navigation ────────────────────────────────────────────────────────────
+// setActiveTab() is the only way to change the visible panel. It guards against
+// switching to Listen/Video when those tabs are not available for this book,
+// then triggers a full renderBookState() to repaint the page.
 
 const setActiveTab = (tab) => {
   if (!bookState.data) return;
@@ -604,7 +952,13 @@ const setActiveTab = (tab) => {
   renderBookState();
 };
 
-// ── Audio player ──────────────────────────────────────────────────────────────
+// ── Audio player (Listen tab) ─────────────────────────────────────────────────
+// The <audio> element is created once by createAudioElement() and reused for
+// the lifetime of the page. renderListenPanel() builds the surrounding UI
+// (now-playing header, playlist, narrator label) and mounts the audio element.
+// loadTrack(index) swaps the src and seeks; timeupdate saves progress every 5 s.
+// Track durations are probed lazily via ensureTrackDurations() to avoid loading
+// metadata for all tracks on initial render.
 
 const syncAudioPlayerUI = (data, refs) => {
   if (!refs.listenContent) return;
@@ -858,7 +1212,9 @@ const renderSidebarChapters = (data, refs) => {
             loadTrack(index);
           });
         } else {
-          btn.textContent = `Chapter ${index + 1}`;
+          const label = chapter?.title || `Chapter ${index + 1}`;
+          btn.textContent = label;
+          btn.title = label;
           btn.addEventListener("click", async () => {
             if (refs.readMain) {
               await saveTextProgress(data, refs, refs.readMain.scrollTop);
@@ -934,15 +1290,14 @@ const createAudioElement = (data, refs, shouldAutoplay = false) => {
   const chapter = data.audioChapters[data.selectedAudioIndex];
   if (chapter) {
     const saved = getAudioResumeTime(data, chapter);
-    const playOnLoad = shouldAutoplay && data.resume?.media_type === "audio";
-    if (saved > 0) {
+    const playOnLoad = data.autoplayOnLoad || (shouldAutoplay && data.resume?.media_type === "audio");
+    data.autoplayOnLoad = false;
+    if (saved > 0 && !playOnLoad) {
       audio.addEventListener("loadedmetadata", () => { audio.currentTime = saved; }, { once: true });
     }
     if (playOnLoad) {
       audio.addEventListener("loadedmetadata", () => {
-        if (saved > 0) {
-          audio.currentTime = saved;
-        }
+        if (saved > 0) audio.currentTime = saved;
         audio.play().catch(() => {});
       }, { once: true });
     }
@@ -1024,20 +1379,44 @@ const renderListenPanel = (data, refs) => {
   ensureTrackDurations(data, refs);
 };
 
+const reflowChapterText = (rawText) => {
+  const source = String(rawText ?? "").replace(/\r\n/g, "\n").trim();
+  if (!source) return "";
+  const paragraphs = source.split(/\n{2,}/);
+  const normalized = paragraphs
+    .map((paragraph) => {
+      const lines = paragraph
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+      if (lines.length === 0) return "";
+      return lines.join(" ");
+    })
+    .filter(Boolean);
+  return normalized.join("\n\n");
+};
+
 const renderReadPanel = (data, refs) => {
   const textChapters = Array.isArray(data.textChapters) ? data.textChapters : [];
   const chapter = textChapters[data.selectedTextIndex] || textChapters[0];
+  const isHtmlContent = chapter?.isHtml === true;
+
+  // Hide sidebar only when HTML has no chapter navigation.
+  const sidebar = document.querySelector("#book-sidebar");
+  if (sidebar) sidebar.hidden = isHtmlContent && textChapters.length <= 1;
 
   if (refs.readerTitle) {
-    refs.readerTitle.textContent = chapter ? `Chapter ${data.selectedTextIndex + 1}` : "Text edition";
+    refs.readerTitle.textContent = isHtmlContent
+      ? (textChapters.length > 1 ? (chapter?.title || data.title || "Full Text") : (data.title || "Full Text"))
+      : chapter
+        ? chapter.title || `Chapter ${data.selectedTextIndex + 1}`
+        : "Text edition";
   }
-  if (refs.readerSubtitle) {
-    refs.readerSubtitle.textContent = textChapters.length > 0
-      ? `${textChapters.length} chapter block${textChapters.length === 1 ? "" : "s"} detected`
-      : "No chapter breaks were detected in the text.";
-  }
+  if (refs.readerSubtitle) refs.readerSubtitle.textContent = "";
   if (!refs.readerContent) return;
   refs.readerContent.innerHTML = "";
+  refs.readerContent.style.width = "100%";
+  refs.readerContent.style.maxWidth = "100%";
 
   if (!chapter) {
     const empty = document.createElement("div");
@@ -1049,15 +1428,48 @@ const renderReadPanel = (data, refs) => {
 
   const panel = document.createElement("article");
   panel.className = "chapter-panel";
-  const heading = document.createElement("h3");
-  heading.textContent = `Chapter ${data.selectedTextIndex + 1}`;
+  panel.style.width = "100%";
+  panel.style.maxWidth = "100%";
+  panel.style.boxSizing = "border-box";
   const body = document.createElement("div");
-  body.className = "book-text";
-  const pre = document.createElement("pre");
-  pre.textContent = chapter.text || "No chapter text available.";
-  body.appendChild(pre);
-  panel.append(heading, body);
+  body.style.width = "100%";
+  body.style.maxWidth = "100%";
+
+  if (chapter.isHtml) {
+    // Parse the Gutenberg HTML edition so the browser renders the book as it was
+    // originally typeset — with inline illustrations (scanned engravings, maps,
+    // photographs) that do not exist in the plain-text edition.
+    // Image src attributes in clean_content already point to /api/books/{id}/images/
+    // which redirects through a signed GCS URL to the self-hosted copy we uploaded
+    // during backfill. We strip <script> tags and on* attributes as a precaution
+    // even though the source is trusted public-domain Gutenberg content.
+    body.className = "book-text book-html-content";
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(data.htmlFullContent || chapter.text, "text/html");
+    sanitizeHtmlDocument(doc);
+    stripGutenbergBoilerplate(doc);
+    while (doc.body.firstChild) {
+      body.appendChild(doc.body.firstChild);
+    }
+  } else {
+    body.className = "book-text";
+    body.textContent = reflowChapterText(chapter.text) || "No chapter text available.";
+  }
+
+  panel.append(body);
   refs.readerContent.appendChild(panel);
+
+  // For reconstructed HTML books, chapter clicks jump to heading anchors.
+  if (chapter?.isHtml && chapter?.anchorId && refs.readMain) {
+    window.requestAnimationFrame(() => {
+      const anchor = body.querySelector(`[id="${chapter.anchorId}"]`);
+      if (anchor) {
+        anchor.scrollIntoView({ block: "start", behavior: "auto" });
+      }
+    });
+    data.readScrollRestored = true;
+    return;
+  }
 
   if (refs.readMain && !data.readScrollListenerBound) {
     refs.readMain.addEventListener("scroll", () => {
@@ -1083,7 +1495,15 @@ const renderReadPanel = (data, refs) => {
   }
 };
 
-// ── Main render ───────────────────────────────────────────────────────────────
+// ── Main render cycle ─────────────────────────────────────────────────────────
+// renderBookState() is the single re-render entry point. It always repaints the
+// hero strip and tab bar, then delegates to the active panel's render function:
+//   About  → summary text + metadata grid (author/narrator/translator/language)
+//            + media-availability badges (Text / Audio / Video)
+//   Read   → renderSidebarChapters() fills the left column chapter list
+//             renderReadPanel() fills the right column with text or HTML content
+//   Listen → renderListenPanel() builds the player UI on first call;
+//             subsequent calls just sync the active track highlight via syncAudioPlayerUI()
 
 const renderBookState = () => {
   const data = bookState.data;
@@ -1140,6 +1560,21 @@ const renderBookState = () => {
   // About tab content
   if (data.mode === "about") {
     if (refs.summary) refs.summary.textContent = data.summary || "Description not available for this title.";
+
+    if (refs.bookMeta) {
+      const textChapters = Array.isArray(data.textChapters) ? data.textChapters : [];
+      const audioChapters = Array.isArray(data.audioChapters) ? data.audioChapters : [];
+      const narrator = data.audio?.narrator;
+      const metaItems = [["Author", data.authors || "Unknown"]];
+      if (data.translator) metaItems.push(["Translator", data.translator]);
+      if (narrator) metaItems.push(["Narrator", narrator]);
+      if (data.language && data.language !== "Unknown") metaItems.push(["Language", data.language]);
+      if (data.publicationDate || data.year) metaItems.push(["Published", data.publicationDate || String(data.year)]);
+      if (textChapters.length > 0) metaItems.push(["Chapters", String(textChapters.length)]);
+      if (audioChapters.length > 0) metaItems.push(["Tracks", String(audioChapters.length)]);
+      refs.bookMeta.innerHTML = renderDefinitionList(metaItems);
+    }
+
     if (refs.mediaTags) {
       const textChapters = Array.isArray(data.textChapters) ? data.textChapters : [];
       const tags = [
@@ -1158,6 +1593,12 @@ const renderBookState = () => {
 };
 
 // ── Data loading ──────────────────────────────────────────────────────────────
+// loadBookDetail() fires four API requests in parallel and assembles the result
+// into a complete bookState snapshot. It also determines the initial tab:
+//   - audio resume position  → mode="listen", autoplayOnLoad=true
+//   - text resume position   → mode="read", selectedTextIndex restored
+//   - last played track      → mode="listen" (no autoplay)
+//   - otherwise              → mode="about"
 
 const loadBookDetail = async (bookId) => {
   const snapshot = createBookState(bookId);
@@ -1177,6 +1618,7 @@ const loadBookDetail = async (bookId) => {
 
   snapshot.title            = description?.source_title    || `Book ${bookId}`;
   snapshot.authors          = description?.source_author   || "Unknown";
+  snapshot.translator       = description?.translator      || "";
   snapshot.year             = parseYearFromPublication(description?.publication_date) || "";
   snapshot.language         = snapshot.language            || "Unknown";
   snapshot.summary          = description?.summary         || "";
@@ -1185,7 +1627,27 @@ const loadBookDetail = async (bookId) => {
   snapshot.content          = content;
   snapshot.audio            = audio;
   snapshot.coverArt         = coverArt;
-  snapshot.textChapters     = splitIntoChapters(content?.clean_content || content?.raw_content || "");
+  snapshot.contentType      = content?.content_type || "text";
+  // Prefer html_content (server-cleaned HTML with GCS image paths) when the book
+  // has inline illustrations.  Falls back to clean_content/raw_content for books
+  // that only have a plain-text edition, or when html_content hasn't been backfilled yet.
+  const htmlSource = content?.has_images && content?.html_content
+    ? content.html_content
+    : (snapshot.contentType === "html" ? (content?.clean_content || content?.raw_content) : null);
+  if (htmlSource) {
+    snapshot.contentType = "html";
+    const htmlModel = buildHtmlReadingModel(
+      htmlSource,
+      description?.source_title || `Book ${bookId}`
+    );
+    snapshot.htmlFullContent = htmlModel.fullHtml;
+    snapshot.textChapters = htmlModel.chapters;
+  } else {
+    snapshot.textChapters = splitIntoChapters(
+      content?.clean_content || content?.raw_content || "",
+      content?.raw_content || ""
+    );
+  }
   snapshot.audioChapters    = Array.isArray(audio?.chapters) ? audio.chapters : [];
   snapshot.hasAudio         = Boolean(audio && (audio.package_url || snapshot.audioChapters.length > 0));
   snapshot.hasVideo         = false;
@@ -1216,10 +1678,15 @@ const loadBookDetail = async (bookId) => {
       ? resumeIndex
       : Math.max(0, Math.min(resumeAudioIndex, snapshot.audioChapters.length - 1));
     snapshot.mode = "listen";
+    snapshot.autoplayOnLoad = true;
   }
 
   if (!snapshot.summary && snapshot.textChapters.length > 0) {
-    snapshot.summary = String(snapshot.textChapters[0].text || "").replace(/\s+/g, " ").trim().slice(0, 400);
+    if (snapshot.contentType === "html" && snapshot.htmlFullContent) {
+      snapshot.summary = extractHtmlSummaryText(snapshot.htmlFullContent, 400);
+    } else {
+      snapshot.summary = String(snapshot.textChapters[0].text || "").replace(/\s+/g, " ").trim().slice(0, 400);
+    }
   }
 
   if (snapshot.mode === "about" && snapshot.audioChapters.length > 0) {
@@ -1257,6 +1724,12 @@ const setupNavSearch = (data) => {
     await navigate(q ? `/home.html?search=${encodeURIComponent(q)}` : "/home.html");
   };
   if (input) {
+    input.addEventListener("dblclick", () => {
+      window.setTimeout(() => {
+        input.focus();
+        input.setSelectionRange(0, input.value.length);
+      }, 0);
+    });
     input.addEventListener("keydown", async (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
