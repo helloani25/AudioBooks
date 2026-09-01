@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from AudioBooks.Catalog.Gutenberg.content_validation import detect_gutenberg_id_mismatch
 from AudioBooks.Catalog.book_category import classify_book

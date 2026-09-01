@@ -70,7 +70,7 @@ except ImportError:
     def load_dotenv(*_args, **_kwargs):  # type: ignore[override]
         return False
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 try:
     from google.cloud import storage as gcs_storage

@@ -1,46 +1,63 @@
-# AudioBooks System Design
-A modular system for browsing and listening to Gutenberg project books.
+# AudioBooks
+A modular system for browsing, reading, listening to, and presenting summarized Project Gutenberg books.
 
 ## Modules
-- **[Authentication](./Authentication)**: User signup, login, and session management.
-- **[Catalog](./Catalog)**: Gutenberg metadata ingestion and API for book search/filtering.
-- **[Presentation](./Presentation)**: React/Vite frontend for the user interface.
-- **[BookSummary](./BookSummary)**: AI summarization pipeline — generates chapter-by-chapter summaries and character profiles via a HuggingFace Inference Endpoint.
+- **[Authentication](./src/AudioBooks/Authentication)**: User signup, login, and session management.
+- **[Catalog](./src/AudioBooks/Catalog)**: Gutenberg metadata ingestion and API for book search/filtering.
+- **[Presentation](./src/AudioBooks/Presentation)**: Vite frontend for the user interface.
+- **[BookSummary](./src/AudioBooks/BookSummary)**: AI summarization pipeline — generates chapter-by-chapter summaries and character profiles via Hugging Face or an OpenAI-compatible RunPod endpoint.
 
 ## Getting Started
 
-1. **Install Dependencies**:
+1. **Create an isolated environment and install the web/catalog dependencies**:
    ```bash
-   pip install -r ../requirements.txt
-   cd Presentation/library && npm install
-   sudo port install redis
-   cat /opt/local/etc/redis.conf
-   redis-server
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python -m pip install -r requirements.txt
+   python -m pip install -e . --no-deps
+   npm --prefix src/AudioBooks/Presentation/library ci
    ```
 
-2. **Set a random `SECRET_KEY`**:
+   To run the local or hosted summarization pipelines too, install the optional
+   ML stack instead:
+   ```bash
+   python -m pip install -r requirements-summarization.txt
+   ```
+
+   For the local Jupyter notebooks, install the notebook tools as well:
+   ```bash
+   python -m pip install -r requirements-notebooks.txt
+   ```
+
+2. **Create the local environment file and set a random `SECRET_KEY`**:
    Flask uses this key to sign session data and CSRF tokens. A predictable key allows cookie/token forgery, and changing the key invalidates existing sessions. Use a long random value per environment.
    ```bash
-   export SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+   cp .env.example src/AudioBooks/.env
+   python -c 'import secrets; print(secrets.token_urlsafe(32))'
    ```
+   Paste the generated value after `SECRET_KEY=` in `src/AudioBooks/.env`.
 
 3. **Start the Backend**:
    Run from the project root:
    ```bash
-   export PYTHONPATH=$PYTHONPATH:src
-   python3 src/AudioBooks/app.py
+   .venv/bin/python -m AudioBooks.app
    ```
-   *Note: Using `PYTHONPATH` ensures that absolute imports like `from AudioBooks...` are resolved correctly.*
 
-
-4. **Install npm**:
-```bash
-npm install
-```
-5. **Start the Frontend**:
+4. **Start the Frontend**:
    ```bash
-   cd src/AudioBooks/Presentation/library
-   npm run dev
+   npm --prefix src/AudioBooks/Presentation/library run dev
+   ```
+
+The backend listens on `http://localhost:5001`; Vite listens on
+`http://localhost:5173` and proxies `/api` requests to Flask.
+
+5. **Optional Redis**:
+   Redis is not required for local development. Without it, Flask sessions use
+   `src/AudioBooks/flask_session/` and catalog caching stays in-process. To use
+   Redis on macOS with MacPorts:
+   ```bash
+   sudo port install redis
+   redis-server
    ```
 
 ## Terraform GPU Instance and Quota Troubleshooting

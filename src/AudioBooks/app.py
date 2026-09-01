@@ -1,8 +1,9 @@
 import os
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().with_name(".env"))
 
 # Ensure the project root is in sys.path so that absolute imports like 'from AudioBooks...' work
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))

@@ -1,81 +1,121 @@
-"""
-Summarize books from Project Gutenberg. Split by chapter and for each chapter split
-for every 10,000 words using gemma
+"""Stream a Gutenberg text from GCS and summarize it with Ollama.
 
+This is the lightweight local-Ollama alternative to the more complete runners
+in :mod:`AudioBooks.BookSummary`. Importing this module never contacts GCS or
+Ollama; external clients are created only after CLI arguments are validated.
 """
 
-import ollama
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
 from google.cloud import storage
 
-# Configuration
-PROJECT_ID = "gen-lang-client-0910392250"
-BUCKET_NAME = "gutenberg-books"
-MODEL = "gemma2:27b"  # Your M4 Max will handle this beautifully
-CHUNK_SIZE = 25000    # Roughly 5,000 - 6,000 words per chunk
 
-client = storage.Client(project=PROJECT_ID)
-bucket = client.bucket(BUCKET_NAME)
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-def stream_and_summarize(blob_name):
-    blob = bucket.blob(blob_name)
-
-    # 1. Open a streaming reader
-    # This reads the file directly from GCS without downloading the whole thing
-    with blob.open("r") as f:
-        chunk_count = 0
-
-        while True:
-            chunk = f.read(CHUNK_SIZE)
-            if not chunk:
-                break  # End of book
-
-            chunk_count += 1
-            print(f"Processing {blob_name} - Chunk {chunk_count}...")
-
-            # 2. Send chunk to your M4 Max GPU via Ollama
-            response = ollama.chat(model=MODEL, messages=[
-                {
-                    'role': 'system',
-                    'content': 'You are a literary assistant. Summarize this text chunk concisely.'
-                },
-                {
-                    'role': 'user',
-                    'content': f"Text: {chunk}"
-                },
-            ])
-
-            summary_part = response['message']['content']
-
-            # 3. Handle the output (Save to a local file or upload back to GCS)
-            save_summary_locally(blob_name, chunk_count, summary_part)
+DEFAULT_MODEL = "gemma2:27b"
+DEFAULT_CHUNK_SIZE = 25_000
 
 
-import ollama
-from google.cloud import storage
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Summarize one GCS Gutenberg text with a local Ollama model.",
+    )
+    parser.add_argument("blob", help="GCS object name containing UTF-8 book text.")
+    parser.add_argument("--bucket", default=os.environ.get("GCS_BUCKET"))
+    parser.add_argument("--project", default=os.environ.get("GOOGLE_CLOUD_PROJECT"))
+    parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Optional JSONL output path. Defaults to stdout only.",
+    )
+    return parser.parse_args()
 
-# 1. Setup GCS
-client = storage.Client(project="gen-lang-client-0910392250")
-bucket = client.bucket("gutenberg-books")
 
-def summarize_book(blob_name):
-    # Download book text
-    blob = bucket.blob(blob_name)
-    text = blob.download_as_text()
+def summarize_chunk(text: str, model: str) -> str:
+    import ollama
 
-    # Since you are chunking, let's take a 10,000 character chunk as an example
-    # You can loop through the whole text in chunks
-    chunk = text[:10000]
+    response = ollama.chat(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a literary assistant. Summarize this text chunk concisely.",
+            },
+            {"role": "user", "content": f"Text:\n{text}"},
+        ],
+    )
+    return str(response["message"]["content"]).strip()
 
-    # 2. Call your local M4 Max GPU
-    response = ollama.chat(model='gemma2:27b', messages=[
-      {
-        'role': 'user',
-        'content': f'Summarize the following book chapter clearly: {chunk}',
-      },
-    ])
 
-    return response['message']['content']
+def stream_and_summarize(
+    bucket,
+    blob_name: str,
+    *,
+    model: str = DEFAULT_MODEL,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    output_path: Path | None = None,
+) -> list[str]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero")
 
-# Example usage
-summary = summarize_book("example_book.txt")
-print(f"Summary: {summary}")
+    summaries: list[str] = []
+    output_file = None
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_file = output_path.open("a", encoding="utf-8")
+
+    try:
+        with bucket.blob(blob_name).open("r", encoding="utf-8") as source:
+            for chunk_index in range(1, 1_000_000_000):
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    break
+                print(f"Processing {blob_name} - chunk {chunk_index}...", flush=True)
+                summary = summarize_chunk(chunk, model)
+                summaries.append(summary)
+                if output_file is not None:
+                    output_file.write(
+                        json.dumps(
+                            {
+                                "blob": blob_name,
+                                "chunk": chunk_index,
+                                "summary": summary,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    output_file.flush()
+    finally:
+        if output_file is not None:
+            output_file.close()
+
+    return summaries
+
+
+def main() -> None:
+    args = parse_args()
+    if not args.bucket:
+        raise ValueError("Set GCS_BUCKET or pass --bucket.")
+
+    client = storage.Client(project=args.project)
+    summaries = stream_and_summarize(
+        client.bucket(args.bucket),
+        args.blob,
+        model=args.model,
+        chunk_size=args.chunk_size,
+        output_path=args.output,
+    )
+    print(json.dumps({"blob": args.blob, "chunks": len(summaries)}), flush=True)
+
+
+if __name__ == "__main__":
+    main()

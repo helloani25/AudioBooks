@@ -78,11 +78,16 @@ document.querySelector("#app").innerHTML = `
 const loginForm = document.querySelector(".form");
 const errorMessage = document.getElementById("error-message");
 
-const resolveRedirectTarget = () => {
-  if (nextTarget && nextTarget.startsWith("/")) {
-    return nextTarget;
+const resolveRedirectTarget = (serverTarget = "/home.html") => {
+  if (nextTarget && nextTarget.startsWith("/") && !nextTarget.startsWith("//")) {
+    try {
+      const target = new URL(nextTarget, window.location.origin);
+      if (target.origin === window.location.origin) {
+        return `${target.pathname}${target.search}${target.hash}`;
+      }
+    } catch (_) {}
   }
-  return "/home.html";
+  return serverTarget || "/home.html";
 };
 
 loginForm.addEventListener("submit", async (e) => {
@@ -110,7 +115,7 @@ loginForm.addEventListener("submit", async (e) => {
 
     const result = await response.json();
     if (response.ok) {
-      window.location.href = result.redirect || resolveRedirectTarget();
+      window.location.href = resolveRedirectTarget(result.redirect);
     } else {
       errorMessage.textContent = result.error || "Login failed";
       errorMessage.style.display = "block";

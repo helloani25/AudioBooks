@@ -53,7 +53,7 @@ def get_last_played():
         return jsonify({"error": "Not authenticated"}), 401
     last_item = media_history_service.get_last_played(user_id)
     if last_item is None:
-        return jsonify({"item": None}), 404
+        return jsonify({"item": None})
     return jsonify({"item": last_item.to_dict()})
 
 
@@ -64,7 +64,7 @@ def get_media_position(book_id: int):
         return jsonify({"error": "Not authenticated"}), 401
     item = media_history_service.get_media_position(user_id, book_id)
     if item is None:
-        return jsonify({"item": None}), 404
+        return jsonify({"item": None})
     return jsonify({"item": item.to_dict()})
 
 

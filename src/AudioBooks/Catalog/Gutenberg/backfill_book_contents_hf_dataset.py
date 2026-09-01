@@ -35,7 +35,7 @@ from AudioBooks.Catalog.Gutenberg.content_validation import (
 DATASET_NAME = "manu/project_gutenberg"
 DEFAULT_SPLIT = "en"
 DB_PATH = Path(__file__).resolve().parent.parent / "DB" / "gutenbergindex.db"
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 hf_token = os.getenv('HF_TOKEN')
 
 def parse_args() -> argparse.Namespace:
