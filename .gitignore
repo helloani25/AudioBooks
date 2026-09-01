@@ -5,11 +5,18 @@ __pycache__/
 
 .env
 
-/AudioBooks/Presentation/library/node_modules/
-/AudioBooks/Catalog/Repository/cache/
-/AudioBooks/Catalog/DB/
-/AudioBooks/Presentation/library/.vite
-/AudioBooks/Presentation/library/dist/
+/src/AudioBooks/Presentation/library/node_modules/
+/src/AudioBooks/Catalog/Repository/cache/
+/src/AudioBooks/Catalog/DB/
+/src/AudioBooks/Presentation/library/.vite
+/src/AudioBooks/Presentation/library/dist/
 /.claude/
-/AudioBooks/Artifacts/
-/AudioBooks/MediaPlayer/DB/
+/src/AudioBooks/Artifacts/
+/src/AudioBooks/MediaPlayer/DB/
+/src/AudioBooks/flask_session/
+/src/AudioBooks/credentials.json
+/src/AudioBooks/Terraform/.terraform.lock.hcl
+/src/AudioBooks/Terraform/terraform.tfstate
+/src/AudioBooks/Terraform/terraform.tfstate.backup
+/src/AudioBooks/Terraform/.terraform/
+.DS_Store

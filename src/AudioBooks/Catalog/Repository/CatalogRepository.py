@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from AudioBooks.Catalog.Gutenberg.content_validation import detect_gutenberg_id_mismatch
+from AudioBooks.Catalog.book_category import classify_book
 
 try:
     import redis
@@ -214,11 +215,17 @@ class CatalogRepository:
                 genres_text TEXT,
                 genres_json TEXT,
                 summary TEXT NOT NULL,
+                category TEXT,
                 source TEXT NOT NULL DEFAULT 'cmu-book-summaries',
                 download_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        try:
+            cur.execute("ALTER TABLE book_desc ADD COLUMN category TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS book_cover_art (
@@ -315,9 +322,11 @@ class CatalogRepository:
                 l.name AS language,
                 b.numdownloads,
                 (SELECT GROUP_CONCAT(name, '|') FROM (SELECT DISTINCT s2.name as name FROM subjects s2 JOIN book_subjects bs2 ON bs2.subjectid = s2.id WHERE bs2.bookid = b.id)) AS subjects,
+                bd.category AS stored_category,
                 ({score_cases}) AS search_score
             FROM books b
             LEFT JOIN languages l ON l.id = b.languageid
+            LEFT JOIN book_desc bd ON bd.bookid = b.id
         """
 
         conditions = []
@@ -361,6 +370,7 @@ class CatalogRepository:
                 "language": row["language"] or "Unknown",
                 "downloads": row["numdownloads"] or 0,
                 "subjects": subjects,
+                "category": row["stored_category"] or classify_book(subjects),
             })
         
         if self.use_redis:
@@ -588,6 +598,7 @@ class CatalogRepository:
         genres_json: str | None,
         summary: str,
         source: str = "cmu-book-summaries",
+        category: str | None = None,
     ) -> None:
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
@@ -603,10 +614,11 @@ class CatalogRepository:
                 genres_text,
                 genres_json,
                 summary,
+                category,
                 source,
                 download_date
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
             (
                 book_id,
@@ -618,6 +630,7 @@ class CatalogRepository:
                 genres_text,
                 genres_json,
                 summary,
+                category,
                 source,
             ),
         )

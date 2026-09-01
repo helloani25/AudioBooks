@@ -5,7 +5,7 @@ import json
 import os
 import re
 from difflib import SequenceMatcher
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,7 +16,12 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 
-from AudioBooks.Test.summary_utils import extract_primary_summary_text, normalize_summary_text
+from AudioBooks.BookSummary.summary_utils import extract_primary_summary_text, normalize_summary_text
+from AudioBooks.Catalog.book_category import (
+    classify_book,
+    classify_book_strict,
+    DRAMATIC, BIOGRAPHICAL, ANALYTICAL, PRACTICAL,
+)
 
 try:
     from transformers import BitsAndBytesConfig
@@ -37,9 +42,11 @@ GCS_DESC_PREFIX = "book-desc"
 CREDENTIALS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
 DEFAULT_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 
-DEFAULT_CHUNK_TOKENS = 6000
+# Aligned with Local_HF_Endpoint.ipynb so all backends produce comparably
+# detailed summaries (larger chunks / a smaller reduce window compressed output).
+DEFAULT_CHUNK_TOKENS = 4096
 DEFAULT_CHUNK_OVERLAP = 400
-DEFAULT_REDUCE_INPUT_TOKENS = 4096
+DEFAULT_REDUCE_INPUT_TOKENS = 8192
 DEFAULT_MAX_NEW_TOKENS = 512
 DEFAULT_REDUCE_MAX_NEW_TOKENS = 768
 DEFAULT_SEMANTIC_THRESHOLD = 0.60
@@ -75,6 +82,8 @@ class BookRecord:
     title: str
     authors: str
     text: str
+    subjects: list[str] = field(default_factory=list)
+    category: str = ""
 
 
 @dataclass
@@ -202,9 +211,12 @@ def _load_book_record(
         title = str(desc.get("source_title") or "Untitled").strip()
         authors = str(desc.get("source_author") or "").replace("|", ", ").strip()
         reference_summary = str(desc.get("summary") or "").strip() or None
+        subjects = [s.strip() for s in desc.get("subjects", []) if s and s.strip()]
+        category = str(desc.get("category") or "").strip()
     else:
         print(f"WARNING: no book-desc found for book_id={book_id}; run book_desc_upload.py", flush=True)
         title, authors, reference_summary = "Untitled", "", None
+        subjects, category = [], ""
 
     # Load content
     text = ""
@@ -220,7 +232,11 @@ def _load_book_record(
             f"Run book_contents_upload.py first."
         )
 
-    return BookRecord(book_id=book_id, title=title, authors=authors, text=text), reference_summary
+    return (
+        BookRecord(book_id=book_id, title=title, authors=authors, text=text,
+                   subjects=subjects, category=category),
+        reference_summary,
+    )
 
 
 def _load_embedding_model(model_id: str, hf_token: str | None = None):
@@ -352,7 +368,14 @@ def load_model(model_id: str, load_in_4bit: bool, hf_token: str | None = None):
     if torch.cuda.is_available():
         model_kwargs["device_map"] = "auto"
         model_kwargs["dtype"] = torch.bfloat16
-        model_kwargs["attn_implementation"] = "flash_attention_2"
+        # Prefer FlashAttention-2 when available; otherwise fall back to PyTorch's
+        # built-in SDPA so the model still loads on GPUs without flash-attn installed.
+        try:
+            import flash_attn  # noqa: F401
+
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+        except ImportError:
+            model_kwargs["attn_implementation"] = "sdpa"
     else:
         model_kwargs["dtype"] = torch.float32
 
@@ -594,6 +617,167 @@ def build_reduction_prompt(book_title: str, scope_label: str, combined_text: str
     )
 
 
+def build_character_profile_prompt(
+    book_title: str,
+    combined_summaries: str,
+    *,
+    category: str = DRAMATIC,
+) -> str:
+    """Build a character/figure profile prompt whose fields vary by book category."""
+    if category == PRACTICAL:
+        return (
+            "### Instruction: Based on the chapter summaries below, write one narrator "
+            "direction profile for this practical/reference audiobook. Do not create "
+            "multiple character profiles.\n"
+            f"### Book: {book_title}\n"
+            "### Provide exactly one profile with these fields:\n"
+            "  - Narrator: single consistent narrator for the whole audiobook\n"
+            "  - Material type: identify the kind of practical/reference work "
+            "(architecture guide, newspaper or magazine collection, physics text, "
+            "manual, cookbook, health guide, craft guide, reference work, etc.)\n"
+            "  - Voice: the narrator's persona and tone, tailored to the material "
+            "(for example: measured architectural docent, brisk periodical reader, "
+            "clear physics lecturer, patient instructor, practical household guide)\n"
+            "  - Expertise: the domain knowledge or reading posture the narrator should convey\n"
+            "  - Pacing: how quickly and densely to read definitions, descriptions, lists, "
+            "measurements, quotations, examples, and technical passages\n"
+            "  - Emphasis: what the narrator should bring forward for listener comprehension "
+            "(spatial detail, chronology, argument structure, experiment setup, procedure, warnings, etc.)\n"
+            "  - Audience relationship: how the narrator guides the listener through the material\n"
+            "### Constraints: Use one narrator only. Match the voice to the book's actual "
+            "subject and format. Do not invent details not present in the summaries.\n"
+            "### Chapter Summaries:\n"
+            f"{combined_summaries}\n"
+            "### Narrator Profile:"
+        )
+
+    if category == DRAMATIC:
+        fields = (
+            "  - Role: protagonist / antagonist / supporting character / etc.\n"
+            "  - Personality: key traits (e.g. brave, scheming, warm-hearted, cynical)\n"
+            "  - Circumstances: events and situations shaping their current mood and demeanor\n"
+            "  - Emotional expression: how they show emotion "
+            "(e.g. weeping, laughing, raging, joyful, hysterical, withdrawn)\n"
+            "  - Physical manner: how they move or carry themselves "
+            "(e.g. hurried, shuffling, upright, trembling, out of breath)"
+        )
+    elif category == BIOGRAPHICAL:
+        fields = (
+            "  - Role: who they are and their significance to the story\n"
+            "  - Character: key personality traits as portrayed by the author\n"
+            "  - Life context: circumstances, struggles, or achievements shaping their story\n"
+            "  - Emotional moments: notable emotional expressions described in the book"
+        )
+    elif category == ANALYTICAL:
+        fields = (
+            "  - Role: their position or function in the subject matter\n"
+            "  - Background: expertise, credentials, or historical period\n"
+            "  - Key contributions: arguments, discoveries, designs, or decisions attributed to them\n"
+            "  - Perspective: their stance, method, or school of thought"
+        )
+    return (
+        "### Instruction: Based on the chapter summaries below, write a detailed profile "
+        "for each named character or significant figure in the book.\n"
+        f"### Book: {book_title}\n"
+        f"### For each person provide:\n{fields}\n"
+        "### Constraints: Only include people who appear by name. "
+        "Do not invent details not present in the summaries.\n"
+        "### Chapter Summaries:\n"
+        f"{combined_summaries}\n"
+        "### Character Profiles:"
+    )
+
+
+_CATEGORY_WORDS = frozenset({DRAMATIC, BIOGRAPHICAL, ANALYTICAL, PRACTICAL})
+
+
+def build_category_prompt(book_title: str, authors: str, summary: str) -> str:
+    """Build a one-word classification prompt for books whose subjects gave no keyword match."""
+    return (
+        "### Instruction: Classify this book into exactly one category.\n"
+        "### Categories:\n"
+        "  dramatic     — fiction, novels, short stories, poetry, plays, mystery, romance, sci-fi, fantasy, horror\n"
+        "  biographical — biography, autobiography, history, memoir, true crime, travel writing\n"
+        "  analytical   — science, philosophy, technology, politics, law, medicine, textbooks, criticism\n"
+        "  practical    — self-help, cookbooks, health, crafts, parenting, reference guides\n"
+        "### Reply with one word only: dramatic, biographical, analytical, or practical.\n"
+        f"### Book: {book_title}\n"
+        f"### Author: {authors}\n"
+        f"### Summary:\n{summary}\n"
+        "### Category:"
+    )
+
+
+def classify_book_with_llm(
+    model,
+    tokenizer,
+    book_title: str,
+    authors: str,
+    summary: str,
+    *,
+    device,
+    max_input_tokens: int,
+) -> str:
+    """Ask the LLM to classify a book when subject-keyword matching gave no result.
+
+    Returns one of the four category constants. Falls back to DRAMATIC if the
+    model response cannot be parsed to a known category.
+    """
+    prompt = build_category_prompt(book_title, authors, summary)
+    raw = _generate_text(
+        model,
+        tokenizer,
+        prompt,
+        device=device,
+        max_input_tokens=max_input_tokens,
+        max_new_tokens=10,
+    )
+    for token in raw.lower().split():
+        word = token.strip(".,;:\"'")
+        if word in _CATEGORY_WORDS:
+            return word
+    return DRAMATIC
+
+
+def extract_character_profiles(
+    model,
+    tokenizer,
+    book_title: str,
+    chapter_results: list[dict],
+    final_summary: str,
+    *,
+    device,
+    reduce_input_tokens: int,
+    profile_max_new_tokens: int = 1024,
+    category: str = DRAMATIC,
+) -> str:
+    """Generate character/figure profiles from chapter summaries.
+
+    Uses all chapter summaries when they fit the context window; falls back to the
+    already-computed final_summary when they don't.
+    """
+    summaries = [ch["summary"] for ch in chapter_results if ch.get("summary", "").strip()]
+    if not summaries:
+        return ""
+
+    combined = "\n\n".join(
+        f"[Chapter {i + 1}] {text}" for i, text in enumerate(summaries)
+    )
+    token_count = len(tokenizer(combined, add_special_tokens=False).input_ids)
+    if token_count > reduce_input_tokens:
+        combined = final_summary
+
+    prompt = build_character_profile_prompt(book_title, combined, category=category)
+    return _generate_text(
+        model,
+        tokenizer,
+        prompt,
+        device=device,
+        max_input_tokens=reduce_input_tokens + 256,
+        max_new_tokens=profile_max_new_tokens,
+    )
+
+
 def reduce_texts(
     model,
     tokenizer,
@@ -662,6 +846,8 @@ def summarize_book(
     max_chunks_per_chapter: int | None,
     story_so_far_tokens: int = 768,
     checkpoint_path: str | None = None,
+    extract_profiles: bool = True,
+    profile_max_new_tokens: int = 1024,
 ) -> dict:
     """Summarize a book chapter-by-chapter, then reduce the chapter summaries to one final summary."""
     from pathlib import Path as _Path
@@ -777,13 +963,45 @@ def summarize_book(
     if checkpoint_path and _Path(checkpoint_path).exists():
         _Path(checkpoint_path).unlink()
 
+    book_category = book.category or classify_book_strict(book.subjects)
+    if not book_category:
+        print("stage: no subject keyword match — classifying category with LLM", flush=True)
+        book_category = classify_book_with_llm(
+            model,
+            tokenizer,
+            book.title,
+            book.authors,
+            final_summary,
+            device=device,
+            max_input_tokens=reduce_input_tokens,
+        )
+        print(f"stage: LLM category={book_category!r}", flush=True)
+
+    character_profiles = ""
+    if extract_profiles and chapter_results:
+        print(f"stage: extracting character profiles category={book_category!r}", flush=True)
+        character_profiles = extract_character_profiles(
+            model,
+            tokenizer,
+            book.title,
+            chapter_results,
+            final_summary,
+            device=device,
+            reduce_input_tokens=reduce_input_tokens,
+            profile_max_new_tokens=profile_max_new_tokens,
+            category=book_category,
+        )
+
     return {
         "book_id": book.book_id,
         "title": book.title,
         "authors": book.authors,
+        "subjects": book.subjects,
+        "category": book_category,
         "chapter_count": len(chapter_results),
         "chapters": chapter_results,
         "final_summary": final_summary,
+        "character_profiles": character_profiles,
     }
 
 

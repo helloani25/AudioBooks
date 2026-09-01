@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audiobooks"
+version = "0.1.0"
+description = "AudioBooks: catalogue, streaming, media player, recommendations and subscriptions."
+readme = "README.md"
+requires-python = ">=3.10"
+# Runtime dependencies are pinned in requirements.txt; keep them there for now.
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+python_files = ["test_*.py", "verify_*.py"]

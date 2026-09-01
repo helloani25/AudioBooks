@@ -41,11 +41,31 @@ _LATEX_LIKE_IDENTIFIERS = (
 )
 _SPACED_MATH_DELIM_OPEN = re.compile(r"\\\s*\[")
 _SPACED_MATH_DELIM_CLOSE = re.compile(r"\\\s*\]")
-_SUMMARY_HEADER_RE = re.compile(r"(?im)^\s*#{3,}\s*summary\s*:\s*")
-_PROMPT_MARKER_RE = re.compile(
-    r"(?im)^\s*#{3,}\s*(instruction|constraints?|excerpt|input summaries|response|book|section|scope|chunk)\s*:",
+# Headers that mark the start of the model's actual answer; we slice AFTER these.
+_ANSWER_HEADER_RE = re.compile(
+    r"(?im)^\s*#{3,}\s*(?:summary|character\s+profiles|narrator\s+profile|category)\s*:?\s*"
 )
-_GENERIC_MARKER_RE = re.compile(r"(?im)^\s*#{3,}\s*")
+# Prompt section labels emitted by the prompt builders. We cut BEFORE the first
+# of these to drop leaked scaffolding — but only these known labels, so a
+# legitimate markdown heading such as a character-name '### Oliver Twist' in a
+# profile is preserved instead of being truncated away.
+_SCAFFOLD_LABELS = (
+    r"instruction|constraints?|excerpt|input\s+summaries|response|book|"
+    r"section|scope|chunk|story\s+so\s+far|chapter\s+summaries|"
+    r"for\s+each\s+person|categories|author|reply\b"
+)
+_PROMPT_MARKER_RE = re.compile(r"(?im)^\s*#{3,}\s*(?:" + _SCAFFOLD_LABELS + r")")
+
+
+def truncate_at_prompt_scaffold(text: str) -> str:
+    """Cut a raw completion at the first leaked prompt-scaffolding header.
+
+    Preserves legitimate markdown headings (e.g. a character-name '### Oliver
+    Twist' in a profile), unlike a naive cut at the first '###'.
+    """
+    text = text.replace("\xa0", " ")
+    marker = _PROMPT_MARKER_RE.search(text)
+    return (text[: marker.start()] if marker else text).strip()
 
 
 def _wrap_latex_math_spans(text: str) -> str:
@@ -90,24 +110,61 @@ def normalize_summary_text(summary: str) -> str:
     return text
 
 
+_MARKDOWN_HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s+\S")
+_BULLET_FIELD_RE = re.compile(r"(?m)^\s*[-*]\s+\S")
+_LEADING_RULE_RE = re.compile(r"^\s*[-*_]{3,}\s*")
+
+
+def _looks_like_profile(text: str) -> bool:
+    """Detect character/figure profile output (headings or repeated bullet fields).
+
+    Profiles use per-person '###' headings and '- Field:' bullets, whereas the
+    summaries this module also cleans are flowing prose.
+    """
+    if _MARKDOWN_HEADING_RE.search(text):
+        return True
+    return len(_BULLET_FIELD_RE.findall(text)) >= 2
+
+
+def normalize_profile_text(profile: str) -> str:
+    """Clean profile output while preserving its line structure.
+
+    Unlike normalize_summary_text (which flattens prose to a single line), this
+    keeps the per-character headings and bullet fields so profiles stay readable:
+    it drops a leading horizontal rule, collapses only intra-line whitespace, and
+    caps consecutive blank lines.
+    """
+    text = profile.replace("\xa0", " ")
+    text = _LEADING_RULE_RE.sub("", text)
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def extract_primary_summary_text(generated_text: str) -> str:
-    """Extract the first summary span and drop leaked prompt scaffolding."""
+    """Extract the model's answer span and drop leaked prompt scaffolding.
+
+    Works for both summaries and character/narrator profiles: slice after the
+    answer header when present, then trim any leaked prompt section. Markdown
+    headings that are part of the answer (e.g. '### <Character Name>') are kept
+    because only the known scaffolding labels trigger truncation. Profile-shaped
+    output keeps its line structure; prose summaries are flattened to one block.
+    """
     text = generated_text.replace("\xa0", " ")
 
-    summary_header = _SUMMARY_HEADER_RE.search(text)
-    if summary_header:
-        text = text[summary_header.end() :]
+    answer_header = _ANSWER_HEADER_RE.search(text)
+    if answer_header:
+        text = text[answer_header.end() :]
 
     prompt_marker = _PROMPT_MARKER_RE.search(text)
     if prompt_marker:
         text = text[: prompt_marker.start()]
 
-    extra_summary = _SUMMARY_HEADER_RE.search(text)
-    if extra_summary:
-        text = text[: extra_summary.start()]
+    extra_answer = _ANSWER_HEADER_RE.search(text)
+    if extra_answer:
+        text = text[: extra_answer.start()]
 
-    generic_marker = _GENERIC_MARKER_RE.search(text)
-    if generic_marker:
-        text = text[: generic_marker.start()]
-
+    if _looks_like_profile(text):
+        return normalize_profile_text(text)
     return normalize_summary_text(text)

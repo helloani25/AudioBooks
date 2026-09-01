@@ -1,39 +1,37 @@
 """
-Upload book_contents from gutenbergindex.db into a GCS bucket.
+Upload book_desc and the gutenberg-id → book_id map to GCS.
 
-Each book's clean_content is written to:
-  gs://<bucket>/book-contents/<bookid>/clean_content.txt   (content_type='text')
-  gs://<bucket>/book-contents/<bookid>/clean_content.html  (content_type='html')
+GCS layout:
+  gs://<bucket>/book-desc/<bookid>.json         per-book title/author/summary
+  gs://<bucket>/book-desc/gutenberg-id-map.json  {str(gutenberg_id): book_id, ...}
 
-Credentials and bucket are read from .env (GOOGLE_APPLICATION_CREDENTIALS, GCS_BUCKET).
-Run state is stored in book_contents_upload_queue so interrupted runs resume automatically.
+Run book_contents_upload.py first to upload content, then this script to upload
+descriptions. After both uploads, summarizer.py needs no SQLite.
 
 Usage:
   # Check prior run state
-  python AudioBooks/BookSummary/book_contents_upload.py --status
+  python AudioBooks/BookSummary/book_desc_upload.py --status
 
   # Dry-run to preview scope
-  python AudioBooks/BookSummary/book_contents_upload.py --dry-run --limit 20
-
-  # Smoke-test: upload 10 books with 2 workers
-  python AudioBooks/BookSummary/book_contents_upload.py --limit 10 --workers 2
+  python AudioBooks/BookSummary/book_desc_upload.py --dry-run --limit 20
 
   # Full upload
-  python AudioBooks/BookSummary/book_contents_upload.py --workers 8 --chunk-size 200
+  python AudioBooks/BookSummary/book_desc_upload.py --workers 8 --chunk-size 200
 
-  # Resume an interrupted run (failed rows retried up to --max-attempts)
-  python AudioBooks/BookSummary/book_contents_upload.py --workers 8 --max-attempts 5
+  # Resume after interruption
+  python AudioBooks/BookSummary/book_desc_upload.py --workers 8 --max-attempts 5
 
-  # Re-upload specific books
-  python AudioBooks/BookSummary/book_contents_upload.py --book-ids 48907,12345 --force
+  # Force re-upload specific books
+  python AudioBooks/BookSummary/book_desc_upload.py --book-ids 48907,12345 --force
 
   # Full re-run from scratch
-  python AudioBooks/BookSummary/book_contents_upload.py --force --reset-queue --workers 8
+  python AudioBooks/BookSummary/book_desc_upload.py --force --reset-queue --workers 8
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -51,13 +49,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from AudioBooks.Catalog.Gutenberg.backfill_missing_book_contents import _normalize_clean_text
+from AudioBooks.Catalog.book_category import classify_book_strict, DRAMATIC
 
 DB_PATH = PROJECT_ROOT / "AudioBooks" / "Catalog" / "DB" / "gutenbergindex.db"
 GCS_BUCKET = os.environ.get("GCS_BUCKET")
-GCS_PREFIX = "book-contents"
+GCS_DESC_PREFIX = "book-desc"
+ID_MAP_BLOB = f"{GCS_DESC_PREFIX}/gutenberg-id-map.json"
 CREDENTIALS_PATH = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-QUEUE_KEY = "upload:v1"
+QUEUE_KEY = "desc:v4"  # bumped: category now persisted to book_desc.category in SQLite
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +78,7 @@ def _make_gcs_client():
 def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=60)
     conn.execute("PRAGMA busy_timeout = 60000")
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -87,7 +87,7 @@ def _ensure_queue_table(db_path: str) -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS book_contents_upload_queue (
+            CREATE TABLE IF NOT EXISTS book_desc_upload_queue (
                 queue_key TEXT NOT NULL,
                 bookid    INTEGER NOT NULL,
                 status    TEXT NOT NULL DEFAULT 'pending',
@@ -99,8 +99,8 @@ def _ensure_queue_table(db_path: str) -> None:
             """
         )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_bcuq_status"
-            " ON book_contents_upload_queue(queue_key, status)"
+            "CREATE INDEX IF NOT EXISTS idx_bduq_status"
+            " ON book_desc_upload_queue(queue_key, status)"
         )
         conn.commit()
     finally:
@@ -111,7 +111,7 @@ def _queue_status(db_path: str) -> dict[str, int]:
     conn = _connect(db_path)
     try:
         cur = conn.execute(
-            "SELECT status, COUNT(*) FROM book_contents_upload_queue"
+            "SELECT status, COUNT(*) FROM book_desc_upload_queue"
             " WHERE queue_key = ? GROUP BY status",
             (QUEUE_KEY,),
         )
@@ -124,11 +124,67 @@ def _reset_queue(db_path: str) -> int:
     conn = _connect(db_path)
     try:
         cur = conn.execute(
-            "DELETE FROM book_contents_upload_queue WHERE queue_key = ?",
+            "DELETE FROM book_desc_upload_queue WHERE queue_key = ?",
             (QUEUE_KEY,),
         )
         conn.commit()
         return cur.rowcount
+    finally:
+        conn.close()
+
+
+_SQLITE_CHUNK = 500  # stay well under SQLite's 999 bind-variable limit
+
+
+def _load_subjects_map(db_path: str, book_ids: list[int]) -> dict[int, list[str]]:
+    """Return {bookid: [subject, ...]} for the given book IDs."""
+    if not book_ids:
+        return {}
+    result: dict[int, list[str]] = {}
+    conn = _connect(db_path)
+    try:
+        for start in range(0, len(book_ids), _SQLITE_CHUNK):
+            chunk = book_ids[start : start + _SQLITE_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            cur = conn.execute(
+                f"SELECT bs.bookid, s.name"
+                f" FROM book_subjects bs JOIN subjects s ON s.id = bs.subjectid"
+                f" WHERE bs.bookid IN ({placeholders}) AND s.name IS NOT NULL"
+                f" ORDER BY bs.bookid, s.name",
+                chunk,
+            )
+            for bookid, name in cur:
+                result.setdefault(int(bookid), []).append(name)
+    finally:
+        conn.close()
+    return result
+
+
+def _ensure_category_column(db_path: str) -> None:
+    """Add book_desc.category column if it does not already exist."""
+    conn = _connect(db_path)
+    try:
+        conn.execute("ALTER TABLE book_desc ADD COLUMN category TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    finally:
+        conn.close()
+
+
+def _write_categories(db_path: str, rows: list[dict]) -> None:
+    """Persist the computed category back into book_desc for each row."""
+    pairs = [(row["category"], row["bookid"]) for row in rows if row.get("category")]
+    if not pairs:
+        return
+    conn = _connect(db_path)
+    try:
+        for start in range(0, len(pairs), _SQLITE_CHUNK):
+            conn.executemany(
+                "UPDATE book_desc SET category = ? WHERE bookid = ?",
+                pairs[start : start + _SQLITE_CHUNK],
+            )
+        conn.commit()
     finally:
         conn.close()
 
@@ -138,9 +194,8 @@ def _load_target_rows(
     book_ids: list[int] | None,
     limit: int | None,
     force: bool,
-) -> list[tuple[int, str, str]]:
+) -> list[dict]:
     conn = _connect(db_path)
-    conn.row_factory = sqlite3.Row
     try:
         conditions: list[str] = []
         params: list = []
@@ -148,54 +203,68 @@ def _load_target_rows(
         if not force:
             conditions.append(
                 "NOT EXISTS ("
-                "  SELECT 1 FROM book_contents_upload_queue q"
-                "  WHERE q.queue_key = ? AND q.bookid = bc.bookid AND q.status = 'done'"
+                "  SELECT 1 FROM book_desc_upload_queue q"
+                "  WHERE q.queue_key = ? AND q.bookid = bd.bookid AND q.status = 'done'"
                 ")"
             )
             params.append(QUEUE_KEY)
 
         if book_ids:
             placeholders = ",".join("?" * len(book_ids))
-            conditions.append(f"bc.bookid IN ({placeholders})")
+            conditions.append(f"bd.bookid IN ({placeholders})")
             params.extend(book_ids)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         limit_clause = f"LIMIT {limit}" if limit else ""
         cur = conn.execute(
-            f"SELECT bc.bookid, bc.raw_content, bc.clean_content, bc.content_type FROM book_contents bc"
-            f" {where} ORDER BY bc.bookid {limit_clause}",
+            f"SELECT bd.bookid, bd.source_title, bd.source_author, bd.summary"
+            f" FROM book_desc bd {where} ORDER BY bd.bookid {limit_clause}",
             params,
         )
-        rows: list[tuple[int, str, str]] = []
-        for r in cur:
-            bookid = int(r["bookid"])
-            content_type = r["content_type"] or "text"
-            clean_content = r["clean_content"] or ""
-            raw_content = r["raw_content"] or ""
-            if content_type == "html":
-                upload_content = clean_content
-            else:
-                # Rebuild text uploads from raw_content so GCS receives the
-                # latest normalization (preamble/TOC/trailer stripping).
-                upload_content = _normalize_clean_text(raw_content or clean_content)
-            rows.append((bookid, upload_content, content_type))
-        return rows
+        rows = [dict(row) for row in cur]
+    finally:
+        conn.close()
+
+    # Attach subjects and derived category to each row.
+    # Priority: subjects regex → summary text regex → dramatic (default).
+    ids = [r["bookid"] for r in rows]
+    subjects_map = _load_subjects_map(db_path, ids)
+    for row in rows:
+        subjects = subjects_map.get(int(row["bookid"]), [])
+        row["subjects"] = subjects
+        category = classify_book_strict(subjects)
+        if not category:
+            summary = (row.get("summary") or "").strip()
+            if summary:
+                category = classify_book_strict([summary])
+        row["category"] = category or DRAMATIC
+    return rows
+
+
+def _load_gutenberg_id_map(db_path: str) -> dict[str, int]:
+    """Return {str(gutenbergbookid): internal_book_id} for all books."""
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT id, gutenbergbookid FROM books WHERE gutenbergbookid IS NOT NULL"
+        )
+        return {str(int(row["gutenbergbookid"])): int(row["id"]) for row in cur}
     finally:
         conn.close()
 
 
-def _seed_queue(db_path: str, rows: list[tuple[int, str, str]]) -> None:
+def _seed_queue(db_path: str, rows: list[dict]) -> None:
     conn = _connect(db_path)
     try:
         conn.executemany(
             """
-            INSERT INTO book_contents_upload_queue (queue_key, bookid, status, attempts)
+            INSERT INTO book_desc_upload_queue (queue_key, bookid, status, attempts)
             VALUES (?, ?, 'pending', 0)
             ON CONFLICT(queue_key, bookid) DO UPDATE SET
                 status = CASE WHEN status IN ('done', 'skipped') THEN status ELSE 'pending' END,
                 updated_at = CURRENT_TIMESTAMP
             """,
-            [(QUEUE_KEY, bookid) for bookid, _, _ in rows],
+            [(QUEUE_KEY, row["bookid"]) for row in rows],
         )
         conn.commit()
     finally:
@@ -210,7 +279,7 @@ def _load_pending(
     conn = _connect(db_path)
     try:
         query = (
-            "SELECT bookid FROM book_contents_upload_queue"
+            "SELECT bookid FROM book_desc_upload_queue"
             " WHERE queue_key = ? AND status IN ('pending', 'failed') AND attempts < ?"
         )
         params: list = [QUEUE_KEY, max_attempts]
@@ -219,8 +288,7 @@ def _load_pending(
             query += f" AND bookid IN ({placeholders})"
             params.extend(only_book_ids)
         query += " ORDER BY bookid"
-        cur = conn.execute(query, params)
-        return [int(row[0]) for row in cur]
+        return [int(row[0]) for row in conn.execute(query, params)]
     finally:
         conn.close()
 
@@ -237,7 +305,7 @@ def _update_queue_status(
     try:
         conn.execute(
             """
-            UPDATE book_contents_upload_queue
+            UPDATE book_desc_upload_queue
             SET status = ?,
                 attempts = attempts + ?,
                 last_error = ?,
@@ -255,19 +323,24 @@ def _update_queue_status(
 # Per-book upload
 # ---------------------------------------------------------------------------
 
-def _upload_book(
-    bucket,
-    bookid: int,
-    content: str,
-    content_type: str,
-) -> tuple[int, str, str]:
-    """Upload one book to GCS. Returns (bookid, status, msg)."""
-    ext = "html" if content_type == "html" else "txt"
-    mime = "text/html" if ext == "html" else "text/plain"
-    blob_path = f"{GCS_PREFIX}/{bookid}/clean_content.{ext}"
+def _upload_desc(bucket, row: dict) -> tuple[int, str, str]:
+    """Upload one book_desc row as JSON to GCS. Returns (bookid, status, msg)."""
+    bookid = int(row["bookid"])
+    payload = json.dumps(
+        {
+            "bookid": bookid,
+            "source_title": row["source_title"] or "Untitled",
+            "source_author": row["source_author"] or "",
+            "summary": row["summary"] or "",
+            "subjects": row.get("subjects") or [],
+            "category": row.get("category") or "",
+        },
+        ensure_ascii=False,
+    )
+    blob_path = f"{GCS_DESC_PREFIX}/{bookid}.json"
     try:
-        bucket.blob(blob_path).upload_from_string(content, content_type=mime)
-        return bookid, "done", f"{ext} {len(content):,} chars → {blob_path}"
+        bucket.blob(blob_path).upload_from_string(payload, content_type="application/json")
+        return bookid, "done", blob_path
     except Exception as exc:
         return bookid, "error", str(exc)
 
@@ -276,7 +349,7 @@ def _upload_book(
 # Main orchestration
 # ---------------------------------------------------------------------------
 
-def upload_book_contents(
+def upload_book_descs(
     db_path: str,
     bucket_name: str,
     *,
@@ -293,6 +366,7 @@ def upload_book_contents(
 ) -> None:
     print(f"stage: initialising db={db_path}", flush=True)
     _ensure_queue_table(db_path)
+    _ensure_category_column(db_path)
 
     prior = _queue_status(db_path)
     if prior:
@@ -308,9 +382,14 @@ def upload_book_contents(
         n = _reset_queue(db_path)
         print(f"stage: queue reset — deleted {n} rows", flush=True)
 
-    print("stage: discovering books in book_contents", flush=True)
+    print("stage: discovering rows in book_desc", flush=True)
     rows = _load_target_rows(db_path, book_ids, limit, force)
     print(f"summary: target_books={len(rows)}", flush=True)
+
+    if rows:
+        print("stage: persisting categories to book_desc table", flush=True)
+        _write_categories(db_path, rows)
+        print(f"stage: wrote {len(rows)} category values to SQLite", flush=True)
 
     if not rows:
         print("done: nothing to do", flush=True)
@@ -319,9 +398,9 @@ def upload_book_contents(
     _seed_queue(db_path, rows)
 
     restrict = bool(book_ids or limit)
-    only_ids = {bookid for bookid, _, _ in rows} if restrict else None
+    only_ids = {row["bookid"] for row in rows} if restrict else None
     pending_ids = set(_load_pending(db_path, max_attempts, only_ids))
-    pending_rows = [(bid, c, ct) for bid, c, ct in rows if bid in pending_ids]
+    pending_rows = [r for r in rows if r["bookid"] in pending_ids]
     already_done = len(rows) - len(pending_rows)
     print(
         f"summary: queued={len(pending_rows)}  already_done={already_done}  max_attempts={max_attempts}",
@@ -334,11 +413,11 @@ def upload_book_contents(
 
     if dry_run:
         print("stage: dry-run enabled; no writes will be committed", flush=True)
-        for bookid, content, content_type in pending_rows[:5]:
-            ext = "html" if content_type == "html" else "txt"
-            print(f"  gs://{bucket_name}/{GCS_PREFIX}/{bookid}/clean_content.{ext} ({len(content):,} chars)")
+        for row in pending_rows[:5]:
+            print(f"  gs://{bucket_name}/{GCS_DESC_PREFIX}/{row['bookid']}.json")
         if len(pending_rows) > 5:
             print(f"  ... and {len(pending_rows) - 5} more")
+        print(f"  gs://{bucket_name}/{ID_MAP_BLOB}")
         return
 
     print(f"stage: connecting to GCS bucket '{bucket_name}'", flush=True)
@@ -350,7 +429,7 @@ def upload_book_contents(
         return
 
     print(
-        f"stage: uploading with workers={workers} chunk_size={chunk_size}",
+        f"stage: uploading book-desc with workers={workers} chunk_size={chunk_size}",
         flush=True,
     )
 
@@ -358,14 +437,13 @@ def upload_book_contents(
     total = len(pending_rows)
     t0 = time.monotonic()
 
-    def _worker(item: tuple) -> tuple[int, str, str]:
-        bookid, content, content_type = item
-        return _upload_book(bucket, bookid, content, content_type)
+    def _worker(row: dict) -> tuple[int, str, str]:
+        return _upload_desc(bucket, row)
 
     for chunk_start in range(0, total, chunk_size):
         chunk = pending_rows[chunk_start : chunk_start + chunk_size]
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_worker, item): item for item in chunk}
+            futures = {pool.submit(_worker, row): row for row in chunk}
             for i, future in enumerate(as_completed(futures), 1):
                 bookid, status, msg = future.result()
                 if status == "done":
@@ -391,9 +469,22 @@ def upload_book_contents(
                         flush=True,
                     )
 
+    # Upload the gutenberg-id map after all book-desc blobs are done
+    print("stage: uploading gutenberg-id-map", flush=True)
+    try:
+        id_map = _load_gutenberg_id_map(db_path)
+        bucket.blob(ID_MAP_BLOB).upload_from_string(
+            json.dumps(id_map, ensure_ascii=False),
+            content_type="application/json",
+        )
+        print(f"stage: uploaded {ID_MAP_BLOB} ({len(id_map):,} entries)", flush=True)
+    except Exception as exc:
+        print(f"ERROR: could not upload gutenberg-id-map: {exc}", flush=True)
+
+    elapsed = time.monotonic() - t0
     print(
         f"done: total={total} uploaded={uploaded} failed={failed}"
-        f" already_done={already_done}",
+        f" already_done={already_done} elapsed={elapsed:.1f}s",
         flush=True,
     )
 
@@ -404,7 +495,7 @@ def upload_book_contents(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Upload book_contents from gutenbergindex.db to GCS.",
+        description="Upload book_desc rows and gutenberg-id map from gutenbergindex.db to GCS.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--db", default=str(DB_PATH), help="Path to gutenbergindex.db")
@@ -426,7 +517,7 @@ def main() -> None:
 
     book_ids = [int(x) for x in args.book_ids.split(",")] if args.book_ids else None
 
-    upload_book_contents(
+    upload_book_descs(
         args.db,
         args.bucket or "",
         book_ids=book_ids,
